@@ -142,8 +142,8 @@ test("启动参数：四个必需开关 + 独立 user-data-dir，不开调试端
   )
   assert.equal(args.at(-1), URL_AUTH, "URL 必须是最后一个非开关参数")
   const anchored = buildIsolatedArgs({ userDataDir: join(TMP_ROOT, "x"), url: URL_AUTH, anchorTab: true })
-  assert.equal(anchored.at(-2), "about:blank", "锚点标签在授权页之前打开")
-  assert.equal(anchored.at(-1), URL_AUTH, "授权页仍保持为活动标签")
+  assert.equal(anchored.at(-2), URL_AUTH, "授权页先打开并保持在前台")
+  assert.equal(anchored.at(-1), "about:blank", "空白锚点标签在后台兜底")
   assert.ok(
     args.every((a) => !/remote-debugging|inspector|devtools/i.test(a)),
     "非必要不开 CDP 调试端口",

@@ -196,7 +196,7 @@ BOTH_CREDENTIALS_OK
 
 `src/isolated-login.mjs` 已扩展：
 
-- `buildIsolatedArgs({ userDataDir, url, anchorTab })`：`anchorTab` 为真时，在授权 URL 前插入 `about:blank`。
+- `buildIsolatedArgs({ userDataDir, url, anchorTab })`：`anchorTab` 为真时，在授权 URL 后追加 `about:blank`；授权页在前台，空白页在后台兜底。
 - `launchIsolatedLogin({ userDataDir, keepProfile, anchorTab })`：
   - `userDataDir`：复用已有临时目录，不再 `mkdtemp`。
   - `keepProfile`：关闭窗口时不删除目录。

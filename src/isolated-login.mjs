@@ -171,7 +171,7 @@ export function buildIsolatedArgs({ userDataDir, url, anchorTab = false } = {}) 
   if (typeof url !== "string" || url.trim() === "") {
     throw new TypeError("buildIsolatedArgs: 需要 url")
   }
-  return [`--user-data-dir=${userDataDir}`, ...REQUIRED_FLAGS, ...(anchorTab ? ["about:blank"] : []), url]
+  return [`--user-data-dir=${userDataDir}`, ...REQUIRED_FLAGS, url, ...(anchorTab ? ["about:blank"] : [])]
 }
 
 /**
