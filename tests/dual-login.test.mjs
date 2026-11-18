@@ -107,6 +107,14 @@ function makeIsolated({ ok = true, error = null } = {}) {
   return { isolatedLogin, launches, closes, removals, events }
 }
 
+async function waitFor(predicate, ms = 1500) {
+  const started = Date.now()
+  while (!predicate()) {
+    if (Date.now() - started > ms) throw new Error("waitFor timeout")
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}
+
 function makeCodeArtsStart(result, counter) {
   return async () => ({
     loginUrl: CODEARTS_URL,
@@ -164,6 +172,7 @@ test("成功路径：同一临时 profile 先果办后码道，写入码道记�
 
   assert.equal(result.type, "success")
   assert.equal(JSON.parse(result.access).securityToken, "ST-OA", "返回的是果办自己的凭据")
+  await waitFor(() => isolated.launches.length === 2 && client.sets.length === 1 && isolated.removals.length === 1)
   assert.equal(isolated.launches.length, 2)
   assert.equal(isolated.launches[1].url, CODEARTS_URL)
   assert.equal(isolated.launches[1].userDataDir, SHARED_PROFILE, "第二次启动复用第一次的临时 profile")
@@ -206,9 +215,10 @@ test("码道超时：果办仍成功，不写码道记录，日志提示可单�
   const started = Date.now()
   const result = await handle.callback()
 
-  assert.ok(Date.now() - started < 1000, "超时有界，不悬挂")
+  assert.ok(Date.now() - started < 1000, "第一个平台应立即返回，不等待后台超时")
   assert.equal(result.type, "success")
   assert.equal(JSON.parse(result.access).securityToken, "ST-OA")
+  await waitFor(() => client.logs.some((entry) => String(entry.message).includes("码道授权未完成，可单独登录")) && isolated.removals.length === 1)
   assert.equal(client.sets.length, 0, "超时不能写码道记录")
   assert.ok(client.logs.some((entry) => String(entry.message).includes("码道授权未完成，可单独登录")))
   assert.equal(counter.closed, 1)
@@ -238,13 +248,13 @@ test("码道失败：果办仍成功，不写码道记录，日志提示可单�
   const result = await handle.callback()
 
   assert.equal(result.type, "success")
+  await waitFor(() => client.logs.some((entry) => String(entry.message).includes("码道授权未完成，可单独登录")) && isolated.removals.length === 1)
   assert.equal(client.sets.length, 0)
-  assert.ok(client.logs.some((entry) => String(entry.message).includes("码道授权未完成，可单独登录")))
   assert.equal(counter.closed, 1)
   assert.deepEqual(isolated.removals, [CODEARTS_URL])
 })
 
-test("第一窗口启动失败：不伪造成功，错误可解释且释放两个 OAuth", async () => {
+test("第一窗口启动失败：不伪造成功，错误可解释且释放果办 OAuth", async () => {
   const client = makeClient()
   const isolated = makeIsolated({ ok: false, error: "未找到 Chromium 浏览器" })
   const { fetcher } = makeFetcher()
@@ -272,7 +282,7 @@ test("第一窗口启动失败：不伪造成功，错误可解释且释放两�
   assert.match(result.error, /未找到 Chromium 浏览器/)
   assert.equal(client.sets.length, 0)
   assert.equal(isolated.launches.length, 1, "第一窗口失败就不开第二窗口")
-  assert.equal(counter.closed, 1, "码道回调服务器取消")
+  assert.equal(counter.closed, 0, "码道流程尚未启动")
   assert.equal(officeClosed, 1, "果办轮询取消")
 })
 
@@ -298,13 +308,13 @@ test("码道已有同身份记录：written:false reason exists，果办仍成�
 
   assert.equal(result.type, "success")
   assert.equal(JSON.parse(result.access).securityToken, "ST-OA")
+  await waitFor(() => client.logs.some((entry) => String(entry.message).includes("未覆盖已存在账号")) && isolated.removals.length === 1)
   assert.equal(client.sets.length, 0, "已存在同身份记录时不覆盖")
-  assert.ok(client.logs.some((entry) => String(entry.message).includes("未覆盖已存在账号")))
   assert.equal(counter.closed, 1)
   assert.deepEqual(isolated.removals, [CODEARTS_URL])
 })
 
-test("果办失败时关闭码道服务器与窗口，不打开第二个窗口", async () => {
+test("果办失败时关闭窗口，不启动码道", async () => {
   const client = makeClient()
   const isolated = makeIsolated()
   const { fetcher } = makeFetcher()
@@ -331,7 +341,7 @@ test("果办失败时关闭码道服务器与窗口，不打开第二个窗口",
   assert.equal(result.type, "failed")
   assert.match(result.error, /果办登录已取消/)
   assert.equal(isolated.launches.length, 1)
-  assert.equal(counter.closed, 1)
+  assert.equal(counter.closed, 0)
   assert.ok(isolated.closes.includes(OFFICEACE_URL))
   assert.equal(isolated.removals.length, 1)
   assert.equal(client.sets.length, 0)
@@ -397,6 +407,7 @@ test("码道入口成功：同一临时 profile 先码道后果办，写入果�
 
   assert.equal(result.type, "success")
   assert.equal(JSON.parse(result.access).access_key_id, "AK-CA-co-success")
+  await waitFor(() => isolated.launches.length === 2 && client.sets.length === 2 && isolated.removals.length === 1)
   assert.equal(isolated.launches.length, 2)
   assert.equal(isolated.launches[0].url, CODEARTS_URL)
   assert.equal(isolated.launches[0].anchorTab, true)
@@ -438,9 +449,9 @@ test("码道入口：果办超时仍返回码道成功，不写果办记录", as
 
   assert.ok(Date.now() - started < 1000)
   assert.equal(result.type, "success")
+  await waitFor(() => client.logs.some((entry) => String(entry.message).includes("果办授权未完成，可单独登录")) && isolated.removals.length === 1)
   assert.equal(client.sets.length, 1)
   assert.ok(client.sets[0].id.startsWith("codearts"))
-  assert.ok(client.logs.some((entry) => String(entry.message).includes("果办授权未完成，可单独登录")))
 })
 
 test("码道入口：果办启动失败仍返回码道成功，不写果办记录", async () => {
@@ -460,9 +471,9 @@ test("码道入口：果办启动失败仍返回码道成功，不写果办记�
   const result = await handle.callback()
 
   assert.equal(result.type, "success")
+  await waitFor(() => client.logs.some((entry) => String(entry.message).includes("果办授权未完成，可单独登录")) && isolated.removals.length === 1)
   assert.equal(client.sets.length, 1)
   assert.ok(client.sets[0].id.startsWith("codearts"))
-  assert.ok(client.logs.some((entry) => String(entry.message).includes("果办授权未完成，可单独登录")))
 })
 
 test("码道入口：果办已有同身份记录时不覆盖，码道仍成功", async () => {
@@ -483,9 +494,9 @@ test("码道入口：果办已有同身份记录时不覆盖，码道仍成功",
   const result = await handle.callback()
 
   assert.equal(result.type, "success")
+  await waitFor(() => client.logs.some((entry) => String(entry.message).includes("未覆盖已存在账号")) && isolated.removals.length === 1)
   assert.equal(client.sets.length, 1, "已有果办同身份记录时不覆盖")
   assert.ok(client.sets[0].id.startsWith("codearts"))
-  assert.ok(client.logs.some((entry) => String(entry.message).includes("未覆盖已存在账号")))
 })
 
 test("码道入口：码道失败时不启动果办，返回失败", async () => {

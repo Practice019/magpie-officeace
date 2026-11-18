@@ -637,15 +637,8 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
           label: "一次验证码登录两个平台",
           async authorize() {
             let officeStarted = null
-            let codeArtsStarted = null
             let officeWindow = null
 
-            const cancelStarts = async () => {
-              for (const started of [codeArtsStarted, officeStarted]) {
-                try { await started?.close?.() } catch {}
-                void started?.result?.catch?.(() => {})
-              }
-            }
             const failed = (message) => ({
               url: "",
               opened: true,
@@ -664,36 +657,26 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
             }
 
             try {
-              codeArtsStarted = await startCodeArtsLogin(maasFetcher)
-            } catch (e) {
-              await cancelStarts()
-              const message = `码道登录启动失败：${String(e?.message ?? e).slice(0, 300)}。${DUAL_OFFICEACE_FAILED_INSTRUCTIONS}`
-              return failed(message)
-            }
-            if (!codeArtsStarted || typeof codeArtsStarted.loginUrl !== "string" || codeArtsStarted.loginUrl === "") {
-              await cancelStarts()
-              return failed(`码道登录启动失败：没有拿到登录地址。${DUAL_OFFICEACE_FAILED_INSTRUCTIONS}`)
-            }
-
-            try {
               officeWindow = await openIsolated({ url: officeStarted.url, keepProfile: true, anchorTab: true })
             } catch (e) {
               officeWindow = null
-              await cancelStarts()
-              const message = `隔离登录窗口启动失败：${String(e?.message ?? e).slice(0, 300)}`
-              return failed(message)
+              try { await officeStarted?.close?.() } catch {}
+              void officeStarted?.result?.catch?.(() => {})
+              return failed(`隔离登录窗口启动失败：${String(e?.message ?? e).slice(0, 300)}`)
             }
             if (!officeWindow?.ok) {
               const message = String(officeWindow?.error || "隔离登录窗口启动失败").slice(0, 500)
               try { await officeWindow?.close?.() } catch {}
-              await cancelStarts()
+              try { await officeStarted.close() } catch {}
+              void officeStarted.result?.catch?.(() => {})
               return failed(message)
             }
 
             const sharedUserDataDir = officeWindow.userDataDir
             if (typeof sharedUserDataDir !== "string" || sharedUserDataDir === "") {
               try { await officeWindow.close?.() } catch {}
-              await cancelStarts()
+              try { await officeStarted.close() } catch {}
+              void officeStarted.result?.catch?.(() => {})
               return failed("隔离登录窗口没有创建共享临时 profile，已停止本次登录。")
             }
 
@@ -703,81 +686,81 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
               method: "auto",
               instructions: DUAL_LOGIN_INSTRUCTIONS,
               async callback() {
-                let codeWindow = null
+                let officeCred
                 try {
-                  const officeCred = await officeStarted.result
-                  const identified = { ...officeCred, ...(await phoneField(officeCred)) }
-                  if (!identified.modelAppKey) noteMaasPending(identified)
-                  void ensureTrialPackage(identified, trialDeps).catch(() => {})
+                  officeCred = await officeStarted.result
+                } catch (e) {
+                  try { await officeWindow.close() } catch {}
+                  try { await officeStarted.close() } catch {}
+                  void officeStarted.result?.catch?.(() => {})
+                  try { await officeWindow.removeProfile?.() } catch {}
+                  return { type: "failed", error: String(e?.message ?? e).slice(0, 500) }
+                }
 
+                const identified = { ...officeCred, ...(await phoneField(officeCred)) }
+                if (!identified.modelAppKey) noteMaasPending(identified)
+                void ensureTrialPackage(identified, trialDeps).catch(() => {})
+                const record = successOf(identified)
+
+                void (async () => {
+                  let codeArtsStarted = null
+                  let codeWindow = null
                   try {
+                    codeArtsStarted = await startCodeArtsLogin(maasFetcher)
+                    if (!codeArtsStarted || typeof codeArtsStarted.loginUrl !== "string" || codeArtsStarted.loginUrl === "") {
+                      log("码道授权未完成，可单独登录：没有拿到登录地址", "warn")
+                      return
+                    }
                     codeWindow = await openIsolated({
                       url: codeArtsStarted.loginUrl,
                       keepProfile: true,
                       userDataDir: sharedUserDataDir,
                       anchorTab: true,
                     })
-                  } catch {
-                    codeWindow = null
-                  }
-
-                  if (!codeWindow?.ok) {
-                    log("码道授权未完成，可单独登录：第二次隔离窗口未能启动", "warn")
-                    return successOf(identified)
-                  }
-
-                  let outcome
-                  try {
-                    outcome = await waitForDualResult(
+                    if (!codeWindow?.ok) {
+                      log("码道授权未完成，可单独登录：第二次隔离窗口未能启动", "warn")
+                      return
+                    }
+                    const outcome = await waitForDualResult(
                       codeArtsStarted.result,
                       codeArtsLoginTimeoutMs,
                       `码道授权超时（${Math.round(codeArtsLoginTimeoutMs / 60_000)} 分钟）`,
                     )
-                  } catch (e) {
-                    log(`码道授权未完成，可单独登录：${String(e?.message ?? e).slice(0, 300)}`, "warn")
-                    return successOf(identified)
-                  }
-
-                  let codeCred = null
-                  try {
-                    codeCred = JSON.parse(outcome?.access ?? "")
-                  } catch {
-                    codeCred = null
-                  }
-                  if (!codeCred?.access_key_id) {
-                    log("码道授权未完成，可单独登录：码道没有返回凭据", "warn")
-                    return successOf(identified)
-                  }
-
-                  let finalized
-                  try {
-                    finalized = await finalizeCodeArtsSignIn(client, codeCred, maasFetcher)
-                  } catch (e) {
-                    log(`码道授权未完成，可单独登录：${String(e?.message ?? e).slice(0, 300)}`, "warn")
-                    return successOf(identified)
-                  }
-                  if (finalized.written) {
-                    log("果办与码道两个平台已使用同一次验证码完成登录。")
-                  } else if (finalized.reason === "exists") {
-                    log("码道已有同身份账号记录，未覆盖已存在账号（果办登录已成功）。", "warn")
-                  } else {
-                    log(`码道授权未完成，可单独登录：${finalized.reason || "写入失败"}`, "warn")
-                  }
-                  return successOf(identified)
-                } catch (e) {
-                  return { type: "failed", error: String(e?.message ?? e).slice(0, 500) }
-                } finally {
-                  try { if (codeWindow?.ok) await codeWindow.close() } catch {}
-                  try { if (officeWindow?.ok) await officeWindow.close() } catch {}
-                  try { await codeArtsStarted?.close?.() } catch {}
-                  void codeArtsStarted?.result?.catch?.(() => {})
-                  for (const window of [codeWindow, officeWindow]) {
+                    let codeCred = null
                     try {
-                      const removed = await window?.removeProfile?.()
-                      if (removed?.removed) break
-                    } catch {}
+                      codeCred = JSON.parse(outcome?.access ?? "")
+                    } catch {
+                      codeCred = null
+                    }
+                    if (!codeCred?.access_key_id) {
+                      log("码道授权未完成，可单独登录：码道没有返回凭据", "warn")
+                      return
+                    }
+                    const finalized = await finalizeCodeArtsSignIn(client, codeCred, maasFetcher)
+                    if (finalized.written) {
+                      log("果办与码道两个平台已使用同一次验证码完成登录。")
+                    } else if (finalized.reason === "exists") {
+                      log("码道已有同身份账号记录，未覆盖已存在账号（果办登录已成功）。", "warn")
+                    } else {
+                      log(`码道授权未完成，可单独登录：${finalized.reason || "写入失败"}`, "warn")
+                    }
+                  } catch (e) {
+                    log(`码道授权未完成，可单独登录：${String(e?.message ?? e).slice(0, 300)}`, "warn")
+                  } finally {
+                    try { if (codeWindow?.ok) await codeWindow.close() } catch {}
+                    try { await codeArtsStarted?.close?.() } catch {}
+                    void codeArtsStarted?.result?.catch?.(() => {})
+                    try { if (officeWindow?.ok) await officeWindow.close() } catch {}
+                    for (const window of [codeWindow, officeWindow]) {
+                      try {
+                        const removed = await window?.removeProfile?.()
+                        if (removed?.removed) break
+                      } catch {}
+                    }
                   }
-                }
+                })()
+
+                return record
               },
             }
           },

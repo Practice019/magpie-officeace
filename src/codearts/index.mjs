@@ -3663,16 +3663,41 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
               instructions:
                 "已打开隔离登录窗口。请完成一次华为云验证码登录；码道授权成功后会自动打开果办授权页，通常无需第二次验证码。",
               async callback() {
-                let officeFlow = null
-                let officeWindow = null
+                const closeFirst = async () => {
+                  try { if (codeWindow?.ok) await codeWindow.close() } catch {}
+                  try { await flow.close() } catch {}
+                  void flow.result?.catch?.(() => {})
+                  try { await codeWindow?.removeProfile?.() } catch {}
+                }
+
+                let outcome
                 try {
-                  const outcome = await flow.result
-                  const cred = safeJson(outcome.access)
-                  if (!cred?.access_key_id) return { type: "failed", error: "CodeArts did not return a credential" }
+                  outcome = await flow.result
+                } catch (e) {
+                  await closeFirst()
+                  return { type: "failed", error: e?.message ?? String(e) }
+                }
+
+                const cred = safeJson(outcome.access)
+                if (!cred?.access_key_id) {
+                  await closeFirst()
+                  return { type: "failed", error: "CodeArts did not return a credential" }
+                }
+
+                let record
+                try {
                   const identified = { ...cred, ...(await accountPhoneField(cred, fetcher)) }
                   const withMaas = await withOfficeAceMaas(identified, fetcher)
-                  const record = successOf(withMaas, outcome.expires)
+                  record = successOf(withMaas, outcome.expires)
                   await writeSharedRecord(client, PROVIDER, withMaas, fetcher)
+                } catch (e) {
+                  await closeFirst()
+                  return { type: "failed", error: e?.message ?? String(e) }
+                }
+
+                void (async () => {
+                  let officeFlow = null
+                  let officeWindow = null
                   try {
                     officeFlow = await beginOfficeAce()
                     officeWindow = await openIsolatedLogin({
@@ -3683,7 +3708,7 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
                     })
                     if (!officeWindow?.ok) {
                       client?.app?.log?.({ service: "codearts", level: "warn", message: "果办授权未完成，可单独登录：第二个隔离窗口未能启动" })
-                      return record
+                      return
                     }
                     const officeCred = await withDeadline(
                       officeFlow.result,
@@ -3700,24 +3725,23 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
                     }
                   } catch (e) {
                     client?.app?.log?.({ service: "codearts", level: "warn", message: `果办授权未完成，可单独登录：${String(e?.message ?? e).slice(0, 300)}` })
+                  } finally {
+                    try { if (officeWindow?.ok) await officeWindow.close() } catch {}
+                    try { await officeFlow?.close?.() } catch {}
+                    void officeFlow?.result?.catch?.(() => {})
+                    try { if (codeWindow?.ok) await codeWindow.close() } catch {}
+                    try { await flow.close() } catch {}
+                    void flow.result?.catch?.(() => {})
+                    for (const window of [officeWindow, codeWindow]) {
+                      try {
+                        const removed = await window?.removeProfile?.()
+                        if (removed?.removed) break
+                      } catch {}
+                    }
                   }
-                  return record
-                } catch (e) {
-                  return { type: "failed", error: e?.message ?? String(e) }
-                } finally {
-                  try { if (officeWindow?.ok) await officeWindow.close() } catch {}
-                  try { await officeFlow?.close?.() } catch {}
-                  void officeFlow?.result?.catch?.(() => {})
-                  try { if (codeWindow?.ok) await codeWindow.close() } catch {}
-                  try { await flow.close() } catch {}
-                  void flow.result?.catch?.(() => {})
-                  for (const window of [officeWindow, codeWindow]) {
-                    try {
-                      const removed = await window?.removeProfile?.()
-                      if (removed?.removed) break
-                    } catch {}
-                  }
-                }
+                })()
+
+                return record
               },
             }
           },
