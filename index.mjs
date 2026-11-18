@@ -40,9 +40,10 @@
 //
 // ═══════════════════════════════════════════════════════════════════════
 
-import { EXPIRY_LEAD_MS } from "./src/constants.mjs"
+import { CLIENT_ID, EXPIRY_LEAD_MS } from "./src/constants.mjs"
 import { credentialOf, toStored } from "./src/credential.mjs"
-import { accountIdentityOf, phoneField } from "./src/phone.mjs"
+import { accountIdentityOf, phoneField, profileOf } from "./src/phone.mjs"
+import { ImportError, importFields, makeImportHook, validateImportDpop, validateImportExpiry, validateImportMaas, validateImportVerifier } from "./src/importer.mjs"
 import { beginLogin, refreshOnce } from "./src/login.mjs"
 import { checkin, fetchCatalog, fetchTokenRates, fetchUsage } from "./src/api.mjs"
 import { chatFetch } from "./src/chat.mjs"
@@ -55,6 +56,7 @@ import { probeClientLogin } from "./src/officeace-client.mjs"
 import { initAutoMaintenance } from "./src/auto-maintenance.mjs"
 import { openConsoleWindow, waitForLoginAndSave, loadSavedCookies, primeSession, closeWindow, CONSOLE_URL } from "./src/console-browser.mjs"
 import { launchIsolatedLogin } from "./src/isolated-login.mjs"
+import { finalizeCodeArtsSignIn, _internal as codeartsInternal } from "./src/codearts/index.mjs"
 
 const PROVIDER = "officeace"
 const PROVIDER_NAME = "果办 OfficeAce"
@@ -114,6 +116,22 @@ const MAAS_OAUTH_INSTRUCTIONS =
 const DEFAULT_MAAS_WATCH_MS = 3 * 60_000
 const DEFAULT_MAAS_WATCH_INTERVAL_MS = 5_000
 const DEFAULT_MAAS_PROBE_MS = 1_200
+const DUAL_CODEARTS_TIMEOUT_MS = 3 * 60_000
+const DUAL_LOGIN_INSTRUCTIONS =
+  "已打开一个独立登录窗口（不带你日常浏览器的 Cookie 或旧账号会话）。" +
+  "同一个华为云账号在这里完成一次短信验证码登录即可：果办 OAuth 完成后，本窗口会接着打开码道授权，通常几秒内自动完成。" +
+  "成功后两个平台各自保存自己的登录凭据；窗口会在流程结束时自动关闭。"
+const DUAL_OFFICEACE_FAILED_INSTRUCTIONS = "一次验证码登录两个平台暂不可用，请改用「华为云账号」单独登录。"
+
+function waitForDualResult(promise, ms, message) {
+  let timer = null
+  const clock = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms)
+  })
+  return Promise.race([promise, clock]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
 
 /**
  * 见过「有凭据、但没有 MaaS appKey」的账号：身份 → 那份凭据。
@@ -156,15 +174,40 @@ function shortUserName(cred) {
 }
 
 function successOf(cred) {
-  const identified = cred
   return {
     type: "success",
-    refresh: identified.refreshToken ?? "",
-    access: JSON.stringify(identified),
-    expires: Date.parse(identified.expiresAt ?? "") || Date.now() + 3600_000,
-    ...accountIdentityOf(identified),
+    refresh: cred.refreshToken ?? "",
+    access: JSON.stringify(cred),
+    expires: Date.parse(cred.expiresAt ?? "") || Date.now() + 3600_000,
+    ...accountIdentityOf(cred),
   }
 }
+
+const officeAceImport = makeImportHook({
+  provider: PROVIDER,
+  label: PROVIDER_NAME,
+  clientId: CLIENT_ID,
+  accessField: "access",
+  async toResult(row) {
+    importFields(row,
+      ["access", "secret", "securityToken", "expiresAt", "refreshToken"],
+      ["accountId", "user_phone", "projectId", "codeVerifier", "oauth_client", "modelAppKey", "modelAppSecret", "maasBaseUrl"],
+      "dpopPrivateJwk",
+    )
+    validateImportExpiry(row.expiresAt)
+    if (row.codeVerifier) validateImportVerifier(row.codeVerifier)
+    validateImportMaas(row.modelAppKey, row.modelAppSecret, row.maasBaseUrl)
+    const profile = profileOf(row)
+    const profileId = [profile?.account_id, profile?.domain_id].find((id) => typeof id === "string" && id.trim())?.trim()
+    if (profileId && row.accountId && row.accountId !== profileId && row.accountId !== `iam::${profileId}`) {
+      throw new ImportError("accountId 与 refresh token 的账号身份不一致")
+    }
+    await validateImportDpop(row.dpopPrivateJwk)
+    const cred = credentialOf({ access: JSON.stringify({ ...row, accountId: profileId || row.accountId }) })
+    if (!cred) throw new ImportError("OfficeAce 凭据结构无效")
+    return successOf(cred)
+  },
+})
 
 /** 记住/忘掉用的键：解析得出的身份优先，拿不到就退到 accountId / refreshToken。 */
 function maasPendingKey(cred) {
@@ -306,6 +349,14 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
     builtin: options?.builtinLogin ?? null,
   })
   const openIsolated = typeof options?.isolatedLogin === "function" ? options.isolatedLogin : launchIsolatedLogin
+  const startCodeArtsLogin =
+    typeof options?.startCodeArtsLogin === "function"
+      ? options.startCodeArtsLogin
+      : (fetcher) => codeartsInternal.startOAuthFlow(fetcher)
+  const codeArtsLoginTimeoutMs =
+    Number.isFinite(options?.codeArtsLoginTimeoutMs) && options.codeArtsLoginTimeoutMs > 0
+      ? options.codeArtsLoginTimeoutMs
+      : DUAL_CODEARTS_TIMEOUT_MS
 
   const log = (msg, level = "info") => {
     try {
@@ -352,13 +403,7 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
           const identified = { ...cred, ...(await phoneField(cred)) }
           if (!identified.modelAppKey) noteMaasPending(identified)
           void ensureTrialPackage(identified, trialDeps).catch(() => {})
-          return {
-            type: "success",
-            refresh: identified.refreshToken ?? "",
-            access: JSON.stringify(identified),
-            expires: Date.parse(identified.expiresAt ?? "") || Date.now() + 3600_000,
-            ...accountIdentityOf(identified),
-          }
+          return successOf(identified)
         } catch (e) {
           return { type: "failed", error: String(e?.message ?? e).slice(0, 500) }
         } finally {
@@ -385,6 +430,7 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
 
     auth: {
       provider: PROVIDER,
+      ...officeAceImport,
       // 内嵌图标（magpie 只存不拉，外部 URL 在 git 源下不渲染）
       icon: ICON,
       maxConcurrency: 3,
@@ -585,6 +631,156 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
           type: "oauth",
           label: "添加其他华为云账号",
           authorize: () => startOAuthAuthorization({ isolated: true }),
+        },
+        {
+          type: "oauth",
+          label: "一次验证码登录两个平台",
+          async authorize() {
+            let officeStarted = null
+            let codeArtsStarted = null
+            let officeWindow = null
+
+            const cancelStarts = async () => {
+              for (const started of [codeArtsStarted, officeStarted]) {
+                try { await started?.close?.() } catch {}
+                void started?.result?.catch?.(() => {})
+              }
+            }
+            const failed = (message) => ({
+              url: "",
+              opened: true,
+              method: "auto",
+              instructions: message,
+              async callback() {
+                return { type: "failed", error: message }
+              },
+            })
+
+            try {
+              officeStarted = await loginMethod.start()
+            } catch (e) {
+              const message = `果办登录启动失败：${String(e?.message ?? e).slice(0, 300)}。${DUAL_OFFICEACE_FAILED_INSTRUCTIONS}`
+              return failed(message)
+            }
+
+            try {
+              codeArtsStarted = await startCodeArtsLogin(maasFetcher)
+            } catch (e) {
+              await cancelStarts()
+              const message = `码道登录启动失败：${String(e?.message ?? e).slice(0, 300)}。${DUAL_OFFICEACE_FAILED_INSTRUCTIONS}`
+              return failed(message)
+            }
+            if (!codeArtsStarted || typeof codeArtsStarted.loginUrl !== "string" || codeArtsStarted.loginUrl === "") {
+              await cancelStarts()
+              return failed(`码道登录启动失败：没有拿到登录地址。${DUAL_OFFICEACE_FAILED_INSTRUCTIONS}`)
+            }
+
+            try {
+              officeWindow = await openIsolated({ url: officeStarted.url, keepProfile: true, anchorTab: true })
+            } catch (e) {
+              officeWindow = null
+              await cancelStarts()
+              const message = `隔离登录窗口启动失败：${String(e?.message ?? e).slice(0, 300)}`
+              return failed(message)
+            }
+            if (!officeWindow?.ok) {
+              const message = String(officeWindow?.error || "隔离登录窗口启动失败").slice(0, 500)
+              try { await officeWindow?.close?.() } catch {}
+              await cancelStarts()
+              return failed(message)
+            }
+
+            const sharedUserDataDir = officeWindow.userDataDir
+            if (typeof sharedUserDataDir !== "string" || sharedUserDataDir === "") {
+              try { await officeWindow.close?.() } catch {}
+              await cancelStarts()
+              return failed("隔离登录窗口没有创建共享临时 profile，已停止本次登录。")
+            }
+
+            return {
+              url: officeStarted.url,
+              opened: true,
+              method: "auto",
+              instructions: DUAL_LOGIN_INSTRUCTIONS,
+              async callback() {
+                let codeWindow = null
+                try {
+                  const officeCred = await officeStarted.result
+                  const identified = { ...officeCred, ...(await phoneField(officeCred)) }
+                  if (!identified.modelAppKey) noteMaasPending(identified)
+                  void ensureTrialPackage(identified, trialDeps).catch(() => {})
+
+                  try {
+                    codeWindow = await openIsolated({
+                      url: codeArtsStarted.loginUrl,
+                      keepProfile: true,
+                      userDataDir: sharedUserDataDir,
+                      anchorTab: true,
+                    })
+                  } catch {
+                    codeWindow = null
+                  }
+
+                  if (!codeWindow?.ok) {
+                    log("码道授权未完成，可单独登录：第二次隔离窗口未能启动", "warn")
+                    return successOf(identified)
+                  }
+
+                  let outcome
+                  try {
+                    outcome = await waitForDualResult(
+                      codeArtsStarted.result,
+                      codeArtsLoginTimeoutMs,
+                      `码道授权超时（${Math.round(codeArtsLoginTimeoutMs / 60_000)} 分钟）`,
+                    )
+                  } catch (e) {
+                    log(`码道授权未完成，可单独登录：${String(e?.message ?? e).slice(0, 300)}`, "warn")
+                    return successOf(identified)
+                  }
+
+                  let codeCred = null
+                  try {
+                    codeCred = JSON.parse(outcome?.access ?? "")
+                  } catch {
+                    codeCred = null
+                  }
+                  if (!codeCred?.access_key_id) {
+                    log("码道授权未完成，可单独登录：码道没有返回凭据", "warn")
+                    return successOf(identified)
+                  }
+
+                  let finalized
+                  try {
+                    finalized = await finalizeCodeArtsSignIn(client, codeCred, maasFetcher)
+                  } catch (e) {
+                    log(`码道授权未完成，可单独登录：${String(e?.message ?? e).slice(0, 300)}`, "warn")
+                    return successOf(identified)
+                  }
+                  if (finalized.written) {
+                    log("果办与码道两个平台已使用同一次验证码完成登录。")
+                  } else if (finalized.reason === "exists") {
+                    log("码道已有同身份账号记录，未覆盖已存在账号（果办登录已成功）。", "warn")
+                  } else {
+                    log(`码道授权未完成，可单独登录：${finalized.reason || "写入失败"}`, "warn")
+                  }
+                  return successOf(identified)
+                } catch (e) {
+                  return { type: "failed", error: String(e?.message ?? e).slice(0, 500) }
+                } finally {
+                  try { if (codeWindow?.ok) await codeWindow.close() } catch {}
+                  try { if (officeWindow?.ok) await officeWindow.close() } catch {}
+                  try { await codeArtsStarted?.close?.() } catch {}
+                  void codeArtsStarted?.result?.catch?.(() => {})
+                  for (const window of [codeWindow, officeWindow]) {
+                    try {
+                      const removed = await window?.removeProfile?.()
+                      if (removed?.removed) break
+                    } catch {}
+                  }
+                }
+              },
+            }
+          },
         },
       ],
 

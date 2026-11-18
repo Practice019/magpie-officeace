@@ -1,5 +1,11 @@
 node_modules/
+dist/
+coverage/
+.cache/
 *.tgz
 *.log
+.env
+.env.*
+plugin-auth.json
 .DS_Store
 _*.mjs

@@ -858,8 +858,10 @@ test("plugin exposes config, provider.models, and an oauth auth method", async (
   assert.equal(typeof plugin.config, "function")
   assert.equal(plugin.provider.id, "codearts")
   assert.equal(plugin.auth.provider, "codearts")
-  assert.equal(plugin.auth.methods.length, 1)
+  assert.equal(plugin.auth.methods.length, 2)
   assert.equal(plugin.auth.methods[0].type, "oauth")
+  assert.equal(plugin.auth.methods[1].type, "oauth")
+  assert.equal(plugin.auth.methods[1].label, "一次验证码登录两个平台")
   assert.equal(typeof plugin.auth.checkin, "function")
   assert.equal(plugin.auth.maxConcurrency, x.ACCOUNT_MAX_INFLIGHT)
 

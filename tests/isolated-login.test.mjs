@@ -141,6 +141,9 @@ test("启动参数：四个必需开关 + 独立 user-data-dir，不开调试端
     "user-data-dir 只能出现一次",
   )
   assert.equal(args.at(-1), URL_AUTH, "URL 必须是最后一个非开关参数")
+  const anchored = buildIsolatedArgs({ userDataDir: join(TMP_ROOT, "x"), url: URL_AUTH, anchorTab: true })
+  assert.equal(anchored.at(-2), "about:blank", "锚点标签在授权页之前打开")
+  assert.equal(anchored.at(-1), URL_AUTH, "授权页仍保持为活动标签")
   assert.ok(
     args.every((a) => !/remote-debugging|inspector|devtools/i.test(a)),
     "非必要不开 CDP 调试端口",
@@ -464,6 +467,80 @@ test("并发登录各自隔离：三个目录互不相同，关一个不影响�
   await a.close()
   await c.close()
   assert.deepEqual([...fs.removeCalls].sort(), [...dirs].sort())
+})
+
+// ── 共享 profile（一次验证码登录两个平台）──────────────────────────────
+
+test("共享 userDataDir：不再 mkdtemp，keepProfile 时 close 不删、removeProfile 显式删且幂等", async () => {
+  const fs = fakeFs()
+  const sp = fakeSpawn()
+  const shared = join(TMP_ROOT, "officeace-isolated-login-shared")
+  const h = await launchWith({ fs, sp, userDataDir: shared, keepProfile: true })
+
+  assert.equal(h.ok, true)
+  assert.equal(h.userDataDir, shared)
+  assert.deepEqual(fs.mkdtempCalls, [], "给了共享目录就不再创建新目录")
+  assert.ok(sp.calls[0].args.includes(`--user-data-dir=${shared}`))
+
+  const closed = await h.close()
+  assert.deepEqual(fs.removeCalls, [], "keepProfile 时 close 不删共享目录")
+  assert.equal(closed.removedDir, false)
+
+  const first = await h.removeProfile()
+  const second = await h.removeProfile()
+  assert.deepEqual(first, { removed: true })
+  assert.deepEqual(second, { removed: true })
+  assert.deepEqual(fs.removeCalls, [shared], "显式删除只发生一次")
+  assert.equal(_internal.activeTimers(), 0)
+})
+
+test("共享 profile 轮换：两个句柄用同一目录，先关窗口再删一次", async () => {
+  const fs = fakeFs()
+  const sp = fakeSpawn()
+  const shared = join(TMP_ROOT, "officeace-isolated-login-rotate")
+  const first = await launchWith({ fs, sp, userDataDir: shared, keepProfile: true })
+  await first.close()
+  const second = await launchWith({ fs, sp, userDataDir: shared, keepProfile: true })
+
+  assert.equal(first.userDataDir, shared)
+  assert.equal(second.userDataDir, shared)
+  assert.equal(sp.calls.length, 2, "两个平台各开一次窗口")
+  assert.equal(fs.removeCalls.length, 0, "轮换期间目录一直在")
+
+  await second.close()
+  assert.deepEqual(await second.removeProfile(), { removed: true })
+  assert.deepEqual(await second.removeProfile(), { removed: true })
+  assert.deepEqual(fs.removeCalls, [shared], "同一句柄的清理只发生一次")
+  await first.close()
+})
+
+test("共享 userDataDir 指向日常 profile：拒绝启动、绝不删除，removeProfile 也不删", async () => {
+  const fs = fakeFs()
+  const sp = fakeSpawn()
+  const h = await launchWith({ fs, sp, userDataDir: CHROME_USER_DATA, keepProfile: true })
+
+  assert.equal(h.ok, false)
+  assert.match(h.error, /日常浏览器 profile/)
+  assert.equal(sp.calls.length, 0)
+  assert.deepEqual(fs.removeCalls, [])
+  assert.deepEqual(await h.removeProfile(), { removed: false, reason: "daily-profile" })
+  await h.close()
+  assert.deepEqual(fs.removeCalls, [], "日常 profile 一律不碰")
+})
+
+test("浏览器未退出时 removeProfile 不删；退出后即使 keepProfile 也能显式删除", async () => {
+  const fs = fakeFs()
+  const sp = fakeSpawn()
+  const shared = join(TMP_ROOT, "officeace-isolated-login-running")
+  const h = await launchWith({ fs, sp, userDataDir: shared, keepProfile: true })
+
+  assert.deepEqual(await h.removeProfile(), { removed: false, reason: "running" })
+  assert.deepEqual(fs.removeCalls, [])
+
+  sp.calls[0].child.emitExit(0, null)
+  assert.deepEqual(fs.removeCalls, [], "onExit 尊重 keepProfile")
+  assert.deepEqual(await h.removeProfile(), { removed: true })
+  assert.deepEqual(fs.removeCalls, [shared])
 })
 
 // ── 静态边界 ──────────────────────────────────────────────────────────

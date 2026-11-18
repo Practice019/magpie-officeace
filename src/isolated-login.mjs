@@ -164,14 +164,14 @@ export function normalizeBrowser(browser) {
  * 本次启动的参数（纯函数，方便断言）。
  * 顺序固定：user-data-dir → 干净启动开关 → 授权 URL（URL 必须是最后一个非开关参数）。
  */
-export function buildIsolatedArgs({ userDataDir, url } = {}) {
+export function buildIsolatedArgs({ userDataDir, url, anchorTab = false } = {}) {
   if (typeof userDataDir !== "string" || userDataDir === "") {
     throw new TypeError("buildIsolatedArgs: 需要 userDataDir")
   }
   if (typeof url !== "string" || url.trim() === "") {
     throw new TypeError("buildIsolatedArgs: 需要 url")
   }
-  return [`--user-data-dir=${userDataDir}`, ...REQUIRED_FLAGS, url]
+  return [`--user-data-dir=${userDataDir}`, ...REQUIRED_FLAGS, ...(anchorTab ? ["about:blank"] : []), url]
 }
 
 /**
@@ -191,6 +191,9 @@ export function buildIsolatedArgs({ userDataDir, url } = {}) {
  *   startupTimeoutMs?: number,
  *   closeTimeoutMs?: number,
  *   signal?: AbortSignal,
+ *   userDataDir?: string,
+ *   keepProfile?: boolean,
+ *   anchorTab?: boolean,
  * }} [options]
  * @returns {Promise<{
  *   ok: boolean,
@@ -204,6 +207,7 @@ export function buildIsolatedArgs({ userDataDir, url } = {}) {
  *   closed: boolean,
  *   close: () => Promise<{killed:boolean, removedDir:boolean}>,
  *   cleanup: () => Promise<{killed:boolean, removedDir:boolean}>,
+ *   removeProfile: () => Promise<{removed:boolean, reason?:string}>,
  * }>}
  */
 export async function launchIsolatedLogin(options = {}) {
@@ -219,7 +223,15 @@ export async function launchIsolatedLogin(options = {}) {
     startupTimeoutMs = STARTUP_TIMEOUT_MS,
     closeTimeoutMs = CLOSE_TIMEOUT_MS,
     signal,
+    userDataDir: sharedUserDataDir = null,
+    keepProfile = false,
+    anchorTab = false,
   } = options
+  const sharedDir =
+    typeof sharedUserDataDir === "string" && sharedUserDataDir.trim() !== ""
+      ? sharedUserDataDir
+      : null
+  const retainProfile = keepProfile === true
 
   /** @type {{ok:boolean,error:string|null,browser:any,userDataDir:string|null,args:string[],child:any,exited:boolean,closed:boolean}} */
   const state = {
@@ -254,15 +266,46 @@ export async function launchIsolatedLogin(options = {}) {
     resolveStart(result)
   }
 
-  function removeTempDir() {
-    if (dirRemoved || dirKept) return
-    if (typeof state.userDataDir !== "string" || state.userDataDir === "") return
+  function deleteProfileDir(force) {
+    if (dirRemoved) return false
+    if (dirKept) return false
+    if (typeof state.userDataDir !== "string" || state.userDataDir === "") return false
+    if (isDailyProfilePath(state.userDataDir, env)) {
+      dirKept = true
+      return false
+    }
+    if (!force && retainProfile) return false
     dirRemoved = true
     try {
       removeDir(state.userDataDir)
     } catch {
       // 清理失败不阻塞登录流程：目录留在 tmp 下也不会污染日常 profile
     }
+    return true
+  }
+
+  function removeTempDir() {
+    deleteProfileDir(false)
+  }
+
+  async function removeProfile() {
+    if (dirRemoved) {
+      closeResult.removedDir = true
+      return { removed: true }
+    }
+    if (typeof state.userDataDir !== "string" || state.userDataDir === "") {
+      return { removed: false, reason: "no-profile" }
+    }
+    if (isDailyProfilePath(state.userDataDir, env)) {
+      dirKept = true
+      return { removed: false, reason: "daily-profile" }
+    }
+    if (state.child && !state.exited && state.child.exitCode === null) {
+      return { removed: false, reason: "running" }
+    }
+    const removed = deleteProfileDir(true)
+    if (removed) closeResult.removedDir = true
+    return removed ? { removed: true } : { removed: false, reason: "not-removed" }
   }
 
   function onExit() {
@@ -385,6 +428,7 @@ export async function launchIsolatedLogin(options = {}) {
       return state.closed
     },
     close,
+    removeProfile,
   }
   handle.cleanup = close
 
@@ -406,7 +450,7 @@ export async function launchIsolatedLogin(options = {}) {
 
   let userDataDir
   try {
-    userDataDir = mkdtempImpl(join(tmpdir, TEMP_PREFIX))
+    userDataDir = sharedDir ?? mkdtempImpl(join(tmpdir, TEMP_PREFIX))
   } catch (error) {
     return fail(`临时 profile 目录创建失败：${errorText(error)}`)
   }
@@ -420,7 +464,7 @@ export async function launchIsolatedLogin(options = {}) {
 
   let args
   try {
-    args = buildIsolatedArgs({ userDataDir, url })
+    args = buildIsolatedArgs({ userDataDir, url, anchorTab })
   } catch (error) {
     removeTempDir()
     return fail(errorText(error))

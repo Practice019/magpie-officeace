@@ -22,6 +22,7 @@ const noModelInfo = async () => new Response(JSON.stringify({ error_code: "APIGW
 
 // 测试里绝不真起浏览器（openConsole 会被插件调用）
 process.env.MAGPIE_OFFICEACE_NO_BROWSER = "1"
+process.env.OFFICEACE_USER_DATA_ROOT = path.join(os.tmpdir(), "officeace-maas-test-no-client")
 
 /** 一个空的临时目录 —— 测试永远不要读本机真的 plugin-auth.json。 */
 function tempAuthFile(name = "plugin-auth.json") {
@@ -188,13 +189,15 @@ test("说明文案：控制台那条如实写「要登录就用同一账号」�
   assert.ok(_internal.MAAS_ALREADY_INSTRUCTIONS.includes("已经开通"))
 })
 
-test("主入口复用凭据，第二入口用于添加其他账号", async () => {
+test("主入口复用凭据，第二入口用于添加其他账号，第三入口一次验证码登录两个平台", async () => {
   const plugin = await OfficeAceAuthPlugin({}, { authFile: tempAuthFile(), fetch: noModelInfo })
-  assert.equal(plugin.auth.methods.length, 2)
+  assert.equal(plugin.auth.methods.length, 3)
   assert.equal(plugin.auth.methods[0].type, "oauth")
   assert.equal(plugin.auth.methods[0].label, "华为云账号")
   assert.equal(plugin.auth.methods[1].type, "oauth")
   assert.equal(plugin.auth.methods[1].label, "添加其他华为云账号")
+  assert.equal(plugin.auth.methods[2].type, "oauth")
+  assert.equal(plugin.auth.methods[2].label, "一次验证码登录两个平台")
 })
 
 test("单入口 · 凭据已能开通：直接完成，不轮询", async () => {

@@ -50,6 +50,9 @@ import path from "node:path"
 
 // 出站 UA 的唯一来源（officeace 与 codearts 共用一条），见 ../constants.mjs 的注释。
 import { UA } from "../constants.mjs"
+import { ImportError, importFields, makeImportHook, validateImportDpop, validateImportExpiry, validateImportMaas, validateImportVerifier } from "../importer.mjs"
+import { beginLogin as beginOfficeAceLogin } from "../login.mjs"
+import { launchIsolatedLogin } from "../isolated-login.mjs"
 import { confirmInviteByCode, ensureInviteCode, noteAccount, resolveInviteCode, syncAccounts } from "./invite.mjs"
 
 const PROVIDER = "codearts"
@@ -691,6 +694,41 @@ function expiresFromCredential(cred) {
   }
   return Date.now() + 86_400_000
 }
+
+function successOf(cred, expires = expiresFromCredential(cred)) {
+  const { id } = accountIdentityOf(cred)
+  return {
+    type: "success",
+    access: JSON.stringify(cred),
+    refresh: cred.refresh_token,
+    expires,
+    accountId: id,
+    ...(id ? { uid: id } : {}),
+  }
+}
+
+const codeArtsImport = makeImportHook({
+  provider: PROVIDER,
+  label: "码道 CodeArts",
+  clientId: CLIENT_ID,
+  accessField: "access_key_id",
+  sessionOf: (row, result) => row.session_id || result.uid,
+  async toResult(row) {
+    importFields(row,
+      ["access_key_id", "secret_access_key", "security_token", "expires_at", "refresh_token", "code_verifier"],
+      ["domain_id", "user_id", "user_name", "user_phone", "session_id", "oauth_client", "model_app_key", "model_app_secret", "maas_base_url"],
+      "dpop_private_key_jwk",
+    )
+    validateImportExpiry(row.expires_at)
+    validateImportVerifier(row.code_verifier)
+    validateImportMaas(row.model_app_key, row.model_app_secret, row.maas_base_url)
+    if (row.session_id && !/^[a-f0-9]{32}$/i.test(row.session_id)) throw new ImportError("session_id 必须是 32 位十六进制字符串")
+    await validateImportDpop(row.dpop_private_key_jwk)
+    const cred = credentialOf({ type: "oauth", access: JSON.stringify(row) })
+    if (!cred) throw new ImportError("CodeArts 凭据结构无效")
+    return successOf(cred)
+  },
+})
 
 /** POST the STS token endpoint with a DPoP proof; `label` is the card that asked. */
 async function requestToken(body, keyPair, fetcher, label = "CodeArts") {
@@ -3129,6 +3167,12 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
   // options.loginMethod = createBuiltinLogin(...) 传进来即可，不用改这里。
   const startLoginFlow =
     typeof options?.loginMethod?.start === "function" ? options.loginMethod.start : startOAuthFlow
+  const openIsolatedLogin = typeof options?.openIsolated === "function" ? options.openIsolated : launchIsolatedLogin
+  const beginOfficeAce = typeof options?.beginOfficeAceLogin === "function" ? options.beginOfficeAceLogin : beginOfficeAceLogin
+  const officeAceLoginTimeoutMs =
+    Number.isFinite(options?.officeAceLoginTimeoutMs) && options.officeAceLoginTimeoutMs > 0
+      ? options.officeAceLoginTimeoutMs
+      : 3 * 60_000
   const thinking = options?.thinking !== false
   const ledgerPath = typeof options?.ledgerPath === "string" && options.ledgerPath ? options.ledgerPath : defaultLedgerPath()
   // Test hooks: the clock and the sleep the retry budget runs on.
@@ -3288,6 +3332,7 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
 
     auth: {
       provider: PROVIDER,
+      ...codeArtsImport,
       // 供应商卡片图标（码道自己的）；插件卡片图标在 package.json 的 magpie.icon（华为云）
       icon: CODEARTS_ICON,
       refreshLead: REFRESH_LEAD_MS,
@@ -3554,14 +3599,7 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
                   // `accountId` is the account's identity — the URN, as main
                   // gives it — so a re-sign-in replaces the account instead of
                   // adding a `codearts#xxxxxx`; `uid` is that same URN.
-                  const record = {
-                    type: "success",
-                    access: JSON.stringify(withMaas),
-                    refresh: cred.refresh_token,
-                    expires: outcome.expires,
-                    accountId: identity.id,
-                    ...(identity.id ? { uid: identity.id } : {}),
-                  }
+                  const record = successOf(withMaas, outcome.expires)
                   // This sign-in writes this card's record only. A Huawei Cloud
                   // refresh token is spent once, so two records holding one
                   // token would sign each other out; the other card has its own
@@ -3577,6 +3615,113 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
             }
           },
         },
+        {
+          type: "oauth",
+          label: "一次验证码登录两个平台",
+          async authorize() {
+            let flow = null
+            let codeWindow = null
+            const failed = (message) => ({
+              url: flow?.loginUrl ?? "",
+              opened: true,
+              method: "auto",
+              instructions: message,
+              async callback() {
+                return { type: "failed", error: message }
+              },
+            })
+            try {
+              flow = await startLoginFlow(fetcher)
+              codeWindow = await openIsolatedLogin({
+                url: flow.loginUrl,
+                keepProfile: true,
+                anchorTab: true,
+              })
+            } catch (e) {
+              try { await flow?.close?.() } catch {}
+              void flow?.result?.catch?.(() => {})
+              return failed(`隔离登录窗口启动失败：${String(e?.message ?? e).slice(0, 300)}`)
+            }
+            if (!codeWindow?.ok) {
+              const message = String(codeWindow?.error || "隔离登录窗口启动失败").slice(0, 500)
+              try { await codeWindow?.close?.() } catch {}
+              try { await flow.close() } catch {}
+              void flow.result?.catch?.(() => {})
+              return failed(message)
+            }
+            const sharedUserDataDir = codeWindow.userDataDir
+            if (typeof sharedUserDataDir !== "string" || sharedUserDataDir === "") {
+              try { await codeWindow.close() } catch {}
+              try { await flow.close() } catch {}
+              void flow.result?.catch?.(() => {})
+              return failed("隔离登录窗口没有创建共享临时 profile，已停止本次登录。")
+            }
+            return {
+              url: flow.loginUrl,
+              opened: true,
+              method: "auto",
+              instructions:
+                "已打开隔离登录窗口。请完成一次华为云验证码登录；码道授权成功后会自动打开果办授权页，通常无需第二次验证码。",
+              async callback() {
+                let officeFlow = null
+                let officeWindow = null
+                try {
+                  const outcome = await flow.result
+                  const cred = safeJson(outcome.access)
+                  if (!cred?.access_key_id) return { type: "failed", error: "CodeArts did not return a credential" }
+                  const identified = { ...cred, ...(await accountPhoneField(cred, fetcher)) }
+                  const withMaas = await withOfficeAceMaas(identified, fetcher)
+                  const record = successOf(withMaas, outcome.expires)
+                  await writeSharedRecord(client, PROVIDER, withMaas, fetcher)
+                  try {
+                    officeFlow = await beginOfficeAce()
+                    officeWindow = await openIsolatedLogin({
+                      url: officeFlow.url,
+                      keepProfile: true,
+                      anchorTab: true,
+                      userDataDir: sharedUserDataDir,
+                    })
+                    if (!officeWindow?.ok) {
+                      client?.app?.log?.({ service: "codearts", level: "warn", message: "果办授权未完成，可单独登录：第二个隔离窗口未能启动" })
+                      return record
+                    }
+                    const officeCred = await withDeadline(
+                      officeFlow.result,
+                      officeAceLoginTimeoutMs,
+                      "果办授权超时",
+                    )
+                    const finalized = await finalizeOfficeAceSignIn(client, officeCred, fetcher)
+                    if (finalized.written) {
+                      client?.app?.log?.({ service: "codearts", level: "info", message: "码道与果办两个平台已使用同一次验证码完成登录。" })
+                    } else if (finalized.reason === "exists") {
+                      client?.app?.log?.({ service: "codearts", level: "warn", message: "果办已有同身份账号记录，未覆盖已存在账号（码道登录已成功）。" })
+                    } else {
+                      client?.app?.log?.({ service: "codearts", level: "warn", message: `果办授权未完成，可单独登录：${finalized.reason || "写入失败"}` })
+                    }
+                  } catch (e) {
+                    client?.app?.log?.({ service: "codearts", level: "warn", message: `果办授权未完成，可单独登录：${String(e?.message ?? e).slice(0, 300)}` })
+                  }
+                  return record
+                } catch (e) {
+                  return { type: "failed", error: e?.message ?? String(e) }
+                } finally {
+                  try { if (officeWindow?.ok) await officeWindow.close() } catch {}
+                  try { await officeFlow?.close?.() } catch {}
+                  void officeFlow?.result?.catch?.(() => {})
+                  try { if (codeWindow?.ok) await codeWindow.close() } catch {}
+                  try { await flow.close() } catch {}
+                  void flow.result?.catch?.(() => {})
+                  for (const window of [officeWindow, codeWindow]) {
+                    try {
+                      const removed = await window?.removeProfile?.()
+                      if (removed?.removed) break
+                    } catch {}
+                  }
+                }
+              },
+            }
+          },
+        },
       ],
     },
   }
@@ -3586,6 +3731,16 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
 function nearExpiry(cred) {
   const at = Date.parse(cred?.expires_at || "")
   return Number.isFinite(at) && at - Date.now() <= INBAND_REFRESH_LEAD_MS
+}
+
+function withDeadline(promise, ms, message) {
+  let timer = null
+  const clock = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms)
+  })
+  return Promise.race([promise, clock]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
 }
 
 /**
@@ -3647,6 +3802,7 @@ export const _internal = {
   isRegularModel, queueInfoOf, waitInQueue, TRACE_QUEUE_URL, SESSION_HEADER,
   snapRequest, dailyCheckin,
   parseModelInfo, extractArray, fetchRemoteModels, dedupeAliases, shortAccountName, creditWindow, benefitWindow, usageFromStatistics,
+  finalizeCodeArtsSignIn, finalizeOfficeAceSignIn, noteProviderAccount, recordKeyFor,
 }
 
 
@@ -4494,6 +4650,38 @@ async function writeSharedRecord(client, target, cred, fetcher = fetch) {
     return null
   }
   return { key, body }
+}
+
+export async function finalizeCodeArtsSignIn(client, cred, fetcher = fetch) {
+  if (!cred || typeof cred !== "object" || typeof cred.access_key_id !== "string" || !cred.access_key_id) {
+    return { credential: cred ?? null, written: false, reason: "invalid-credential" }
+  }
+  const identified = { ...cred, ...(await accountPhoneField(cred, fetcher)) }
+  const enriched = await withOfficeAceMaas(identified, fetcher)
+  const identity = accountIdentityOf(enriched).id
+  if (!identity) return { credential: enriched, written: false, reason: "no-identity" }
+  if (!recordKeyFor(PROVIDER, identity)) return { credential: enriched, written: false, reason: "exists" }
+  const record = await writeSharedRecord(client, PROVIDER, enriched, fetcher)
+  if (!record) return { credential: enriched, written: false, reason: "write-failed" }
+  return { credential: enriched, written: true }
+}
+
+export async function finalizeOfficeAceSignIn(client, cred, fetcher = fetch) {
+  const internal = officeAceCredentialOf(cred)
+  if (!internal) return { credential: cred ?? null, written: false, reason: "invalid-credential" }
+  const enriched = await withOfficeAceMaas(internal, fetcher)
+  const identity = officeAceIdentityOf(enriched)
+  const account = identity.accountId || identity.uid
+  if (!account) return { credential: enriched, written: false, reason: "no-identity" }
+  const key = recordKeyFor(OFFICEACE_PROVIDER, account)
+  if (!key) return { credential: enriched, written: false, reason: "exists" }
+  const body = officeAceRecordBody(enriched)
+  try {
+    await client?.auth?.set?.({ path: { id: key }, body })
+  } catch {
+    return { credential: enriched, written: false, reason: "write-failed" }
+  }
+  return { credential: enriched, written: true, key }
 }
 
 /**
