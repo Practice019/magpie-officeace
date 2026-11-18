@@ -1,3 +1,13 @@
+## 0.3.7 — 2026-11-18
+
+**支持导入 VS Code CodeBot 导出的嵌套 CodeArts 凭据。**
+
+- **嵌套格式适配**：接受 `platform: "codearts"`、`auth` 下的驼峰字段（`accessKeyId` / `secretAccessKey` / `securityToken` / `expiresAt` / `refresh_token` / `clientId` / `codeVerifier`），以及 `dpop.privateKeyJwk`；导入时转换为插件内部的扁平蛇形凭据。
+- **到期时间**：`expiresAt` 支持 Unix 秒、Unix 毫秒或 ISO 8601，导入后统一为 ISO 8601。
+- **`vscode-codebot` client**：导入器允许 `oauth_client: "vscode-codebot"`；刷新时按该 client 发送 `client_id` 和原有 `code_verifier`，DPoP 私钥继续用于签名。
+- **回归**：`tests/importer.test.mjs` 新增嵌套凭据导入和 `vscode-codebot` 刷新测试；`npm test` 362 项通过。
+- **安全**：已经出现在聊天、日志或截图中的 `secretAccessKey` / `securityToken` / refresh token / DPoP 私钥应视为泄露，导入前请重新登录换一套新凭据。
+
 ## 0.3.6 — 2026-11-18
 
 **修复隔离登录窗口把空白锚点页放在前台，授权页在后台不可见，导致第二个平台页面“没出现”并超时的问题。**

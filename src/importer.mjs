@@ -71,7 +71,7 @@ export function validateImportMaas(key, secret, base) {
   }
 }
 
-export function makeImportHook({ provider, label, clientId, accessField, sessionOf, toResult }) {
+export function makeImportHook({ provider, label, clientId, allowedClients = [clientId], accessField, sessionOf, toResult, normalizeRow }) {
   return {
     importFrom: `${label} 账号 UTF-8 JSON（单对象、数组或 version: 1 容器；最多处理前 100 条，不支持 NDJSON）`,
     async import(texts, { signal } = {}) {
@@ -101,11 +101,14 @@ export function makeImportHook({ provider, label, clientId, accessField, session
           if (signal?.aborted || results.length >= IMPORT_MOST) break
           try {
             if (!isObject(row)) throw new ImportError("账号必须是结构化 JSON 对象")
-            const { provider: declared, ...cred } = row
-            if ((!parsed.tagged || Object.hasOwn(row, "provider")) && declared !== provider) {
+            const declared = row.provider ?? row.platform
+            if ((!parsed.tagged || Object.hasOwn(row, "provider") || Object.hasOwn(row, "platform")) && declared !== provider) {
               throw new ImportError("账号的 provider 缺失或与当前供应商不匹配")
             }
-            if (Object.hasOwn(cred, "oauth_client") && cred.oauth_client !== clientId) {
+            const normalized = normalizeRow ? await normalizeRow(row) : row
+            if (!isObject(normalized)) throw new ImportError("账号必须是结构化 JSON 对象")
+            const { provider: _provider, platform: _platform, ...cred } = normalized
+            if (Object.hasOwn(cred, "oauth_client") && !allowedClients.includes(cred.oauth_client)) {
               throw new ImportError("OAuth client 与当前供应商不匹配")
             }
             const result = await toResult(cred)

@@ -149,6 +149,7 @@ const STS_TOKEN_ENDPOINT = "https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/t
 
 // OAuth client id (equals the plugin's URI scheme) and local callback path.
 const CLIENT_ID = "codearts-agent"
+const VSCODE_CODEBOT_CLIENT_ID = "vscode-codebot"
 const REDIRECT_PATH = "/oauth/callback"
 // What the portal expects the calling plugin to be called (reverse-engineered
 // constants — the plugin/version match the real IDE extension, not this package).
@@ -707,10 +708,34 @@ function successOf(cred, expires = expiresFromCredential(cred)) {
   }
 }
 
+function normalizeCodeArtsImport(row) {
+  if (!row || typeof row !== "object" || Array.isArray(row) || !row.auth || typeof row.auth !== "object") return row
+  const auth = row.auth
+  const dpop = row.dpop && typeof row.dpop === "object"
+    ? (row.dpop.privateKeyJwk ?? row.dpop)
+    : row.dpop_private_key_jwk
+  const expires = auth.expiresAt ?? auth.expires_at ?? row.expires_at ?? row.expiresAt
+  const expiresAt = typeof expires === "number"
+    ? new Date(expires < 1e12 ? expires * 1000 : expires).toISOString()
+    : expires
+  return {
+    access_key_id: auth.accessKeyId ?? auth.access_key_id ?? row.access_key_id,
+    secret_access_key: auth.secretAccessKey ?? auth.secret_access_key ?? row.secret_access_key,
+    security_token: auth.securityToken ?? auth.security_token ?? row.security_token,
+    expires_at: expiresAt,
+    refresh_token: auth.refresh_token ?? auth.refreshToken ?? row.refresh_token,
+    code_verifier: auth.codeVerifier ?? auth.code_verifier ?? row.code_verifier,
+    dpop_private_key_jwk: dpop,
+    oauth_client: auth.clientId ?? auth.client_id ?? row.oauth_client ?? CLIENT_ID,
+  }
+}
+
 const codeArtsImport = makeImportHook({
   provider: PROVIDER,
   label: "码道 CodeArts",
   clientId: CLIENT_ID,
+  allowedClients: [CLIENT_ID, VSCODE_CODEBOT_CLIENT_ID],
+  normalizeRow: normalizeCodeArtsImport,
   accessField: "access_key_id",
   sessionOf: (row, result) => row.session_id || result.uid,
   async toResult(row) {
@@ -785,9 +810,9 @@ function exchangeAuthorizationCode(code, codeVerifier, port, keyPair, fetcher, l
   }, keyPair, fetcher, label)
 }
 
-function exchangeRefreshToken(refreshToken, codeVerifier, keyPair, fetcher) {
+function exchangeRefreshToken(refreshToken, codeVerifier, keyPair, fetcher, clientId = CLIENT_ID) {
   return requestToken({
-    client_id: CLIENT_ID,
+    client_id: clientId,
     code_verifier: codeVerifier,
     grant_type: GRANT_REFRESH_TOKEN,
     refresh_token: refreshToken,
@@ -806,9 +831,11 @@ async function refreshCredential(cred, fetcher) {
     )
   }
   const keyPair = keyPairFromStoredJwk(cred.dpop_private_key_jwk)
-  const token = await exchangeRefreshToken(refreshToken, cred.code_verifier, keyPair, fetcher)
+  const client = refreshClientOf(cred)
+  const token = await exchangeRefreshToken(refreshToken, cred.code_verifier, keyPair, fetcher, client)
   const next = credentialFromTokenResponse(token, cred.code_verifier, keyPair)
   if (!next.refresh_token) next.refresh_token = refreshToken
+  if (!next.oauth_client) next.oauth_client = client
   // Preserve non-rotating identity fields a legacy login may have carried, and
   // the session id: it belongs to the account, not to the token.
   for (const k of ["domain_id", "user_id", "user_name", "session_id"]) {
@@ -4565,7 +4592,10 @@ function accountKeySuffix(identity) {
 function refreshClientOf(cred) {
   // A canonical credential with no marker of its own is this package's own shape
   // (the CodeArts reader stamps it); only the old OfficeAce chain says pdp5.
-  return firstOf(cred?.oauth_client) === OA_AGENTARTS_CLIENT_ID ? OA_AGENTARTS_CLIENT_ID : "codearts-agent"
+  const client = firstOf(cred?.oauth_client)
+  if (client === OA_AGENTARTS_CLIENT_ID) return OA_AGENTARTS_CLIENT_ID
+  if (client === VSCODE_CODEBOT_CLIENT_ID) return VSCODE_CODEBOT_CLIENT_ID
+  return "codearts-agent"
 }
 
 /**
@@ -4759,15 +4789,15 @@ async function renewOfficeAceCredential(cred, fetcher = fetch) {
   }
   const keyPair = keyPairFromStoredJwk(cred.dpop_private_key_jwk)
   const client = refreshClientOf(cred)
-  const token = client === "codearts-agent"
+  const token = client === OA_AGENTARTS_CLIENT_ID
     ? await requestToken({
-        client_id: CLIENT_ID,
-        code_verifier: firstOf(cred.code_verifier),
+        client_id: OA_AGENTARTS_CLIENT_ID,
         grant_type: GRANT_REFRESH_TOKEN,
         refresh_token: firstOf(cred.refresh_token),
       }, keyPair, fetcher, "OfficeAce")
     : await requestToken({
-        client_id: OA_AGENTARTS_CLIENT_ID,
+        client_id: client,
+        code_verifier: firstOf(cred.code_verifier),
         grant_type: GRANT_REFRESH_TOKEN,
         refresh_token: firstOf(cred.refresh_token),
       }, keyPair, fetcher, "OfficeAce")

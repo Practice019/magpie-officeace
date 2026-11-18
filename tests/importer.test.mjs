@@ -32,6 +32,21 @@ const codeArtsRow = {
   session_id: "a".repeat(32),
 }
 
+const vsCodeRow = {
+  platform: "codearts",
+  userid: "ca-oauth_test",
+  auth: {
+    accessKeyId: "test-vscode-ak",
+    secretAccessKey: "test-vscode-sk",
+    securityToken: "test-vscode-st",
+    expiresAt: Math.floor(Date.parse(expiry) / 1000),
+    refresh_token: jwt({ principal_urn: "iam::test-vscode-domain:user:test-vscode-user" }, "vscode"),
+    clientId: "vscode-codebot",
+    codeVerifier: "w".repeat(64),
+  },
+  dpop: { privateKeyJwk: privateJwk },
+}
+
 const json = JSON.stringify
 const { provider: caProvider, ...caFields } = codeArtsRow
 const wrapped = (provider, accounts) => ({ provider, version: 1, accounts })
@@ -72,6 +87,31 @@ test("包入口暴露两个原生导入钩子，返回可被现有凭据读取�
   assert.deepEqual(artsCred.dpop_private_key_jwk, privateJwk)
   assert.equal(artsCred.code_verifier, codeArtsRow.code_verifier)
   assert.equal(artsCred.session_id, codeArtsRow.session_id)
+})
+
+test("导入 VS Code CodeBot 的嵌套凭据，并按 vscode-codebot 续期", async (t) => {
+  const { ca } = await hooks(t)
+  const [result] = await ca.import([json(vsCodeRow)])
+  assert.equal(result.type, "success")
+  assert.equal(result.uid, "iam::test-vscode-domain:user:test-vscode-user")
+  const cred = codeArts.credentialOf({ ...result, type: "oauth" })
+  assert.equal(cred.oauth_client, "vscode-codebot")
+  assert.equal(cred.expires_at, "2030-01-01T00:00:00.000Z")
+  assert.deepEqual(cred.dpop_private_key_jwk, privateJwk)
+  let body
+  const fetcher = async (url, init) => {
+    assert.equal(String(url), codeArts.STS_TOKEN_ENDPOINT)
+    body = new URLSearchParams(init.body)
+    return Response.json({
+      credentials: { access_key_id: "AK2", secret_access_key: "SK2", security_token: "ST2", expiration: expiry },
+      refresh_token: "R2",
+    })
+  }
+  const next = await codeArts.refreshCredential(cred, fetcher)
+  assert.equal(body.get("client_id"), "vscode-codebot")
+  assert.equal(body.get("code_verifier"), vsCodeRow.auth.codeVerifier)
+  assert.equal(next.oauth_client, "vscode-codebot")
+  assert.equal(next.access_key_id, "AK2")
 })
 
 test("逐条拒绝错供应商、错误格式或身份、无效 DPoP 和非官方网关；错误不回显输入", async (t) => {
