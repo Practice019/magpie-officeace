@@ -1,6 +1,6 @@
 {
   "name": "magpie-officeace",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "Huawei Cloud for magpie: OfficeAce (果办) and CodeArts (码道) in one package — OAuth sign-in, live models, credit windows, daily check-in and CodeArts invitations.",
   "type": "module",
   "main": "./index.mjs",
@@ -43,12 +43,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/MYCF711/magpie-officeace.git"
+    "url": "git+https://github.com/Practice019/magpie-officeace.git"
   },
   "bugs": {
-    "url": "https://github.com/MYCF711/magpie-officeace/issues"
+    "url": "https://github.com/Practice019/magpie-officeace/issues"
   },
-  "homepage": "https://github.com/MYCF711/magpie-officeace#readme",
+  "homepage": "https://github.com/Practice019/magpie-officeace#readme",
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
   },

@@ -1,3 +1,11 @@
+## 0.3.8 — 2026-11-18
+
+**补充仓库与搜索元数据，便于在 GitHub / npm 搜索中命中。**
+
+- `repository`、`bugs`、`homepage` 指向 `Practice019/magpie-officeace`。
+- 保留 `magpie` / `magpie-plugin` / `provider` / `auth` / `codearts` / `officeace` 等关键词，并添加 GitHub Topics。
+- 不改变插件运行逻辑。
+
 ## 0.3.7 — 2026-11-18
 
 **支持导入 VS Code CodeBot 导出的嵌套 CodeArts 凭据。**
