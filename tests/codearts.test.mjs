@@ -233,6 +233,28 @@ test("prepareChatBody reshapes a chat into what the gateway accepts and meters",
   assert.equal(x.prepareChatBody(null), null)
 })
 
+test("CodeArts DeepSeek V4.1 Flash defaults to no thinking for tool-enabled requests", () => {
+  const request = {
+    model: "codearts/deepseek-v4.1-flash",
+    messages: [{ role: "user", content: "Read the sample" }],
+    tools: [{ type: "function", function: { name: "read" } }],
+    stream: true,
+  }
+  const adapted = x.prepareChatBody(request)
+  assert.deepEqual(adapted.body.thinking, { type: "disabled" })
+  assert.equal(adapted.injected, true)
+  assert.equal(request.thinking, undefined)
+  for (const type of ["enabled", "disabled"]) {
+    const explicit = x.prepareChatBody({ ...request, thinking: { type } })
+    assert.deepEqual(explicit.body.thinking, { type })
+    assert.equal(explicit.injected, false)
+  }
+  for (const overrides of [{ tools: [] }, { tool_choice: "none" }, { model: "deepseek-v4-flash-0731" }]) {
+    assert.deepEqual(x.prepareChatBody({ ...request, ...overrides }).body.thinking, { type: "enabled" })
+  }
+  assert.equal(x.prepareChatBody(request, { thinking: false }).body.thinking, undefined)
+})
+
 test("MAX_OUTPUT_TOKENS pins the /api/v1 output range at 32000", () => {
   // Measured against the live gateway on 2026-11-13 (deepseek-v4.1-flash,
   // kimi-k3.1-pro, glm-5.3, openpangu-2.0-pro): 32000 answers 200, 32001..32768
@@ -946,6 +968,28 @@ test("a streaming caller gets the upstream stream intact, peeked bytes included"
   const res = await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [], stream: true }))
   assert.equal(res.status, 200)
   assert.equal(await res.text(), okStream)
+})
+
+test("an orphaned parameter tag in thinking is never sent as a tool call", async () => {
+  const cred = await makeCred()
+  for (const name of ["read", "pwsh"]) {
+    const stream = sse(
+      { id: "c2", choices: [{ delta: { reasoning_content: "[redacted]<para" } }] },
+      { id: "c2", choices: [{ delta: { reasoning_content: `meter name="${name}">` } }] },
+      { id: "c2", choices: [{ delta: {}, finish_reason: "stop" }] },
+      "[DONE]",
+    )
+    const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: async () => sseResponse(stream) })
+    const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+    const request = { model: "deepseek-v4.1-flash", messages: [], tools: [{ type: "function", function: { name } }] }
+    const streamed = await loaded.fetch(CHAT_URL, chatInit({ ...request, stream: true }))
+    assert.equal(await streamed.text(), stream)
+    const folded = await loaded.fetch(CHAT_URL, chatInit(request))
+    const [choice] = (await folded.json()).choices
+    assert.equal(choice.finish_reason, "stop")
+    assert.equal(choice.message.content, "")
+    assert.equal(choice.message.tool_calls, undefined)
+  }
 })
 
 test("a folded answer keeps reasoning, tool calls and usage apart", async () => {

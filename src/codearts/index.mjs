@@ -1078,8 +1078,10 @@ function prepareChatBody(parsed, { thinking = true } = {}) {
   // The gateway accepts `thinking` for GLM without complaint, so the 400
   // fallback below never fires — `disabled` has to be said outright.
   const glm = NO_THINKING_MODELS.test(String(body.model ?? ""))
+  const deepseekWithTools = /^deepseek-v4\.1-flash$/i.test(body.model) &&
+    Array.isArray(body.tools) && body.tools.length > 0 && body.tool_choice !== "none"
   const injected = thinking && body.thinking === undefined && !glm
-  if (injected) body.thinking = ENABLE_THINKING
+  if (injected) body.thinking = deepseekWithTools ? DISABLE_THINKING : ENABLE_THINKING
   if (glm && body.thinking === undefined) body.thinking = DISABLE_THINKING
   for (const k of ["max_tokens", "max_completion_tokens"]) {
     if (typeof body[k] === "number" && body[k] > MAX_OUTPUT_TOKENS) body[k] = MAX_OUTPUT_TOKENS
