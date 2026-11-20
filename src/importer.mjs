@@ -6,13 +6,50 @@ const isText = (value) => typeof value === "string" && value.trim() === value &&
 
 export class ImportError extends Error {}
 
+/**
+ * Parse NDJSON / 多行 JSON 对象。
+ *
+ * 用户不该为了导入去改文件格式：VSCode 导出的凭据常常是「一行一个对象」。
+ * 这里逐行解析，坏行**只丢那一行**（结果里自然少一条），空行与 `#` / `//`
+ * 注释行直接跳过。一行是数组时把元素展开（`[{...},{...}]` 也认）。
+ *
+ * 全部行都解析失败时返回空数组，由调用方抛原有错误 —— 裸凭据/日志不能
+ * 因为「看起来像多行」就被当成账号。
+ *
+ * @param {string} text
+ * @returns {any[]}
+ */
+function parseLines(text) {
+  const rows = []
+  for (const raw of String(text ?? "").split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith("#") || line.startsWith("//")) continue
+    let parsed
+    try {
+      parsed = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (Array.isArray(parsed)) rows.push(...parsed)
+    else rows.push(parsed)
+  }
+  return rows
+}
+
 function accountsOf(text, provider) {
+  const cleaned = String(text ?? "").replace(/^\uFEFF/, "")
   let data
   try {
     if (typeof text !== "string") throw new Error()
-    data = JSON.parse(text.replace(/^\uFEFF/, ""))
+    // 先整份解析：单对象 / 数组 / version 容器的行为与错误文案保持原样。
+    data = JSON.parse(cleaned)
   } catch {
-    throw new ImportError("需要 UTF-8 JSON；不支持 NDJSON、裸凭据或日志")
+    // 再按行解析（NDJSON）：一条坏行不该让整份文件失败。
+    const rows = parseLines(cleaned)
+    if (!rows.length) {
+      throw new ImportError("需要 UTF-8 JSON（对象、数组或每行一个对象的 NDJSON）；不支持裸凭据或日志")
+    }
+    data = rows.length === 1 ? rows[0] : rows
   }
   if (isObject(data) && (Object.hasOwn(data, "accounts") || Object.hasOwn(data, "version"))) {
     if (data.provider !== provider) throw new ImportError("容器的 provider 缺失或与当前供应商不匹配")
@@ -73,7 +110,7 @@ export function validateImportMaas(key, secret, base) {
 
 export function makeImportHook({ provider, label, clientId, allowedClients = [clientId], accessField, sessionOf, toResult, normalizeRow }) {
   return {
-    importFrom: `${label} 账号 UTF-8 JSON（单对象、数组或 version: 1 容器；最多处理前 100 条，不支持 NDJSON）`,
+    importFrom: `${label} 账号 UTF-8 JSON（单对象、数组、version: 1 容器，或每行一个对象的 NDJSON；最多处理前 100 条）`,
     async import(texts, { signal } = {}) {
       if (signal?.aborted) return []
       if (!Array.isArray(texts) || texts.length === 0) return [{ type: "failed", error: "没有可导入的 JSON 文件" }]

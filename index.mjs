@@ -183,10 +183,95 @@ function successOf(cred) {
   }
 }
 
+/**
+ * 把 register-machine 导出的嵌套行拍平成 officeace 导入钩子的白名单字段。
+ *
+ * register-machine 的 `accounts-export-*.jsonl` 一行长这样：
+ *
+ *   { platform: "officeace", userid: "oa-oauth_<hex>",
+ *     auth: { accessKeyId, secretAccessKey, securityToken, expiresAt,
+ *             refresh_token, clientId, codeVerifier },
+ *     dpop: { privateKeyJwk }, gateway: { baseUrl, modelAppKey, modelAppSecret } }
+ *
+ * `toResult` 只认平铺字段（access/secret/securityToken/expiresAt/refreshToken…），
+ * 所以这里负责「拆包装」；`auth`/`dpop`/`gateway`/`userid` 这些容器键不能留在
+ * 结果里，否则又会命中「存在不支持的字段」。
+ *
+ * ⚠ 旧扁平格式**必须原样通过**：只要 `row.access` 是非空字符串就直接返回原行，
+ * 一个字段都不动（保证已有测试与用户手写的记录不回归）。
+ *
+ * ⚠ 缺 `gateway` 时不写 MaaS 三键 —— 塞 `undefined` 会让 importFields 的
+ * 可选字段校验以为「有这个字段」。
+ */
+function normalizeOfficeAceImport(row) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return row
+  if (typeof row.access === "string" && row.access) return row
+
+  const auth = row.auth && typeof row.auth === "object" && !Array.isArray(row.auth) ? row.auth : null
+  if (!auth) return row
+
+  const text = (...values) => values.find((v) => typeof v === "string" && v.trim())?.trim()
+  const dpop = row.dpop && typeof row.dpop === "object"
+    ? (row.dpop.privateKeyJwk ?? row.dpop)
+    : row.dpopPrivateJwk
+  const gateway = row.gateway && typeof row.gateway === "object" && !Array.isArray(row.gateway)
+    ? row.gateway
+    : null
+
+  // 秒级时间戳 → ISO：successOf 用 Date.parse(expiresAt)，秒会被当成毫秒落成 1970。
+  const expires = auth.expiresAt ?? auth.expires_at ?? row.expiresAt ?? row.expires_at
+  const expiresAt = typeof expires === "number"
+    ? new Date(expires < 1e12 ? expires * 1000 : expires).toISOString()
+    : expires
+
+  const access = text(auth.accessKeyId, auth.access_key_id, row.access)
+  // 没有 AK 的行交给 toResult 原样报错（它要给出「access 必须为非空字符串」这种
+  // 精确文案）；这里补一个占位键只为让流程走下去，绝不伪造凭据值。
+  if (!access) {
+    return { ...row, access: row.access ?? "" }
+  }
+
+  const codeVerifier = text(auth.codeVerifier, auth.code_verifier, row.codeVerifier)
+  const oauthClient = text(auth.clientId, auth.client_id, row.oauth_client)
+  const accountId = text(row.userid, row.user_id, auth.userId, auth.user_id, row.accountId)
+
+  /** @type {Record<string, any>} */
+  const out = {
+    access: text(auth.accessKeyId, auth.access_key_id, row.access),
+    secret: text(auth.secretAccessKey, auth.secret_access_key, row.secret),
+    securityToken: text(auth.securityToken, auth.security_token, row.securityToken),
+    expiresAt,
+    refreshToken: text(auth.refresh_token, auth.refreshToken, row.refreshToken),
+    accountId,
+    dpopPrivateJwk: dpop,
+    ...(codeVerifier ? { codeVerifier } : {}),
+    ...(oauthClient ? { oauth_client: oauthClient } : {}),
+  }
+
+  // 只在 gateway 真的给了对应值时才写，缺啥不补啥。
+  if (gateway) {
+    const modelAppKey = text(gateway.modelAppKey, gateway.model_app_key)
+    const modelAppSecret = text(gateway.modelAppSecret, gateway.model_app_secret)
+    const maasBaseUrl = text(gateway.baseUrl, gateway.base_url)
+    if (modelAppKey) out.modelAppKey = modelAppKey
+    if (modelAppSecret) out.modelAppSecret = modelAppSecret
+    if (maasBaseUrl) out.maasBaseUrl = maasBaseUrl
+  }
+
+  for (const key of Object.keys(out)) {
+    if (out[key] === undefined) delete out[key]
+  }
+  return out
+}
+
 const officeAceImport = makeImportHook({
   provider: PROVIDER,
   label: PROVIDER_NAME,
   clientId: CLIENT_ID,
+  // register-machine 的 officeace 行带 `clientId: "codearts-agent"`（同一个 STS
+  // 授权服务器）；只放行它，别把 vscode 的 client 也放进来。
+  allowedClients: [CLIENT_ID, "codearts-agent"],
+  normalizeRow: normalizeOfficeAceImport,
   accessField: "access",
   async toResult(row) {
     importFields(row,
@@ -199,8 +284,34 @@ const officeAceImport = makeImportHook({
     validateImportMaas(row.modelAppKey, row.modelAppSecret, row.maasBaseUrl)
     const profile = profileOf(row)
     const profileId = [profile?.account_id, profile?.domain_id].find((id) => typeof id === "string" && id.trim())?.trim()
-    if (profileId && row.accountId && row.accountId !== profileId && row.accountId !== `iam::${profileId}`) {
-      throw new ImportError("accountId 与 refresh token 的账号身份不一致")
+    // 两边的身份坐标必须可比才谈得上「不一致」：
+    //   · 双方都是 iam:: URN  → 直接比
+    //   · 双方都是 oa-/ca-oauth_ 前缀 → 直接比
+    //   · 一边 URN 一边裸 domain id → 也允许（claim 可能只给 domain id）
+    //   · 一边是导出行的 userid（oa-oauth_…）、另一边是 claim 里的 domain id →
+    //     不同坐标系，**不比较**（否则真实导出会被判成「身份不一致」）。
+    //
+    // ⚠ 但「两边都认不出坐标、又明显不同」的情况必须继续拒：那是同一份输入里
+    // 把 A 的 accountId 贴到 B 的 refresh_token 上（历史用例就靠这一条）。
+    const isUrn = (value) => /^iam::/i.test(String(value ?? "").trim())
+    const isOAuthId = (value) => /^(?:oa|ca)-oauth_/i.test(String(value ?? "").trim())
+    if (profileId && row.accountId) {
+      const left = String(profileId).trim()
+      const right = String(row.accountId).trim()
+      const leftUrn = isUrn(left)
+      const rightUrn = isUrn(right)
+      const leftOAuth = isOAuthId(left)
+      const rightOAuth = isOAuthId(right)
+      const sameAsUrn = left === right || right === `iam::${left}` || left === `iam::${right}`
+      const comparable =
+        (leftUrn && rightUrn) ||
+        (leftOAuth && rightOAuth) ||
+        leftUrn || // 一边是 URN，标准写法：`iam::<domain>` 包一层即可
+        rightUrn ||
+        (!leftOAuth && !rightOAuth) // 无前缀的裸 id：看起来同源，必须比对
+      if (comparable && !sameAsUrn) {
+        throw new ImportError("accountId 与 refresh token 的账号身份不一致")
+      }
     }
     await validateImportDpop(row.dpopPrivateJwk)
     const cred = credentialOf({ access: JSON.stringify({ ...row, accountId: profileId || row.accountId }) })

@@ -718,6 +718,14 @@ function normalizeCodeArtsImport(row) {
   const expiresAt = typeof expires === "number"
     ? new Date(expires < 1e12 ? expires * 1000 : expires).toISOString()
     : expires
+  // VSCode CodeBot 导出的行把身份放在**顶层** `userid`（`ca-oauth_<hex>`），
+  // `auth` 里没有 user 字段。少了它 `successOf` 拿不到稳定身份，整行被判
+  // 「缺少可用的稳定账号身份」—— 一个真实的号就这么被整条丢掉了。
+  //
+  // 只认字符串：`userid: 12345` / 对象 / 数组都不是身份，宁可让这行失败，
+  // 也不能把一个假 uid 写进 magpie。
+  const user_id = firstOf(auth.userId, auth.user_id, row.userid, row.user_id, row.domain_id)
+  const user_name = firstOf(auth.userName, row.user_name, row.account_name)
   return {
     access_key_id: auth.accessKeyId ?? auth.access_key_id ?? row.access_key_id,
     secret_access_key: auth.secretAccessKey ?? auth.secret_access_key ?? row.secret_access_key,
@@ -727,6 +735,8 @@ function normalizeCodeArtsImport(row) {
     code_verifier: auth.codeVerifier ?? auth.code_verifier ?? row.code_verifier,
     dpop_private_key_jwk: dpop,
     oauth_client: auth.clientId ?? auth.client_id ?? row.oauth_client ?? CLIENT_ID,
+    ...(user_id ? { user_id } : {}),
+    ...(user_name ? { user_name } : {}),
   }
 }
 
