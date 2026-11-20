@@ -52,7 +52,7 @@ test("T32-O1) OfficeAce：auth.options 形状合规，只有 trialbit 一个开�
   assert.equal(p.auth.options.length, 1)
   assert.deepEqual(p.auth.options.map((o) => o.key), ["trialbit"])
   for (const o of p.auth.options) assertOptionShape(o, "officeace")
-  // 默认开：改造前后行为不变（真机一直在自动领体验版）
+  // T-39 一度把默认改成 `false`，用户驳回：「那个 trialbit 没问题，不要改」。
   assert.equal(p.auth.options[0].default, true)
   assert.deepEqual(OFFICEACE_OPTIONS.map((o) => o.key), ["trialbit"])
 })

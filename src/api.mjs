@@ -146,12 +146,10 @@ export async function fetchCatalog(cred) {
 /**
  * 拉订阅 → magpie 的 usage.windows。
  *
- * 响应含两类桶：
- *   skus[].quotas[]    套餐桶，`sku_attr_code === 'officeace_points'`
- *   bonus_skus[]       活动桶
- *
- * ⚠ `.trial` 后缀的 sku **不带到期时间**（试用不过期语义）—— 不猜。
  * ⚠ 查询失败**不吞**：带原因抛出，由调用方显示。
+ *
+ * T-39：与 {@link windowsFromSubscription} 拆开 —— 登录流程本来就要读一次订阅
+ * （判 trial），那次读到的响应能**顺手**变成额度缓存，不必再发一次请求。
  */
 export async function fetchUsage(cred) {
   const r = await signV11Request(`${SUBSCRIPTION_BASE}${SUBSCRIPTION_PATH}`, cred, "GET")
@@ -167,6 +165,22 @@ export async function fetchUsage(cred) {
     throw new Error("订阅查询失败：响应不是 JSON")
   }
 
+  return windowsFromSubscription(j)
+}
+
+/**
+ * 订阅响应（原始 JSON）→ magpie 的 `{plan, windows}`。
+ *
+ * 响应含两类桶：
+ *   skus[].quotas[]    套餐桶，`sku_attr_code === 'officeace_points'`
+ *   bonus_skus[]       活动桶
+ *
+ * ⚠ `.trial` 后缀的 sku **不带到期时间**（试用不过期语义）—— 不猜。
+ *
+ * @param {any} j 订阅接口的原始 JSON
+ * @returns {{plan: string, windows: object[]}}
+ */
+export function windowsFromSubscription(j) {
   const windows = []
   const nowMs = Date.now()
   let planName = ""

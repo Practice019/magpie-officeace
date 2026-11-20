@@ -32,3 +32,16 @@ export function unreadableWindow(reason) {
   const why = String(reason ?? "").trim() || "未知原因"
   return { name: `${NOTE_PREFIX}额度读不到（${why}）`, aside: true, display: why }
 }
+
+/**
+ * 「额度还没读过」的说明窗（T-39）。
+ *
+ * `auth.usage` 只读缓存，所以**没有任何缓存**时它只能说「还没读过」——
+ * 这不是错误，也不该编数字（编数字比说"不知道"更糟）。
+ *
+ * @param {string} [display] 怎么读取（各插件入口不同）
+ * @returns {{name: string, aside: true, display: string}}
+ */
+export function usageUnreadWindow(display = "点面板「刷新」读取") {
+  return { name: `${NOTE_PREFIX}额度未读`, aside: true, display: String(display) }
+}

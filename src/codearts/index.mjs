@@ -53,7 +53,11 @@ import { UA } from "../constants.mjs"
 // 模型能力**只在一处映射**（与 OfficeAce 那条 provider 共用同一个函数）：
 // 上游给了什么能力就说什么，没给就是纯文本。
 import { upstreamCapabilities, pickUpstreamCapabilities } from "../models.mjs"
-import { QUOTA_PREFIX, unreadableWindow } from "../window-names.mjs"
+import { QUOTA_PREFIX, unreadableWindow, usageUnreadWindow } from "../window-names.mjs"
+// 缓存读写与原子写的唯一入口（T-39 建的，T-40 复用）。文件名用 codearts 自己的
+// 前缀：**绝不与 officeace 共用条目**（两个 provider 的目录/额度语义不同）。
+import { cacheDirOf, readCacheEntry, writeCacheEntry } from "../cache.mjs"
+import { pastHalfLife, readJwtClaims } from "../token-life.mjs"
 import { ImportError, importFields, makeCollector, makeImportHook, validateImportDpop, validateImportExpiry, validateImportMaas, validateImportVerifier } from "../importer.mjs"
 import { makePasteImportMethod } from "../paste-import.mjs"
 import { officeAceAuthFile } from "../accounts.mjs"
@@ -100,7 +104,10 @@ const NPM = "@ai-sdk/openai-compatible" // chat completions
 // `${CHAT_API_BASE}/chat/completions`.
 const CHAT_API_BASE = "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2"
 // Snap-access manager host: model list, account/quota, check-in.
-const SNAP_HOST = "https://snap-access.cn-north-4.myhuaweicloud.com"
+//
+// ⚠ T-40 测试用正则发现它（"the gateway host"），请保持这一行的形状：
+//   upstream 目录缓存的键就是这个主机（`MODELS_CACHE_KEY`）。
+const SNAP_HOST = "https://snap-access.cn-north-4.myhuaweicloud.com" // the gateway host
 const SNAP_MODEL_BUILTIN_URL = `${SNAP_HOST}/v1/model/builtin`
 const SNAP_STATISTICS_URL = `${SNAP_HOST}/snap-manager/v1/statistics/plugin`
 // opengw gateway config: the benefit/free-quota model set.
@@ -196,7 +203,11 @@ const REQUEST_TIMEOUT_MS = 30_000
 const OAUTH_CALLBACK_TIMEOUT_MS = 180_000
 const MIN_CALLBACK_PORT = 10_000
 
-// magpie renews this long before the credential expires.
+// magpie renews this long before the credential expires (**不动**：续期本来没问题).
+// T-42：**恢复非 0 的小提前量**（T-40 改成 0 是错的 —— 0 意味着 magpie 只在到点之后
+// 才来问，临期那段窗口完全没人兜；30 分钟是原值，也是与 `INBAND_REFRESH_LEAD_MS`
+// 分工的基准：magpie 提前 30 分钟问，loader 只在最后 2 分钟 + 401 时兜底。
+// 「50% 才真续」由 `auth.refresh` 内部把关（会话 JWT 的 iat/exp），与这个提前量无关。
 const REFRESH_LEAD_MS = 30 * 60 * 1000
 // The loader renews in-band only this close to expiry, well after magpie's own
 // renewal, so the two never spend the one-time refresh token twice.
@@ -723,6 +734,10 @@ function credentialOf(auth) {
 }
 
 function expiresFromCredential(cred) {
+  // T-41：`expires` 必须是**真实会话期限**。真机实测 `expires_at`（华为云 STS）只有 ~1 小时，
+  // 而会话 JWT 还有 ~27 天 —— 写短的会让 magpie 每轮都判「该续期」，反复打 STS。
+  const claims = readJwtClaims(cred?.refresh_token)
+  if (claims) return claims.exp * 1000
   if (cred?.expires_at) {
     const parsed = Date.parse(cred.expires_at)
     if (!Number.isNaN(parsed)) return parsed
@@ -910,6 +925,16 @@ async function accountSessionIds(cred) {
   const seed = firstOf(cred.session_id, accountIdentityOf(cred).id, cred.access_key_id)
   const digest = await sha256Hex(utf8(`codearts-session:${seed}`))
   return { sessionId: digest.slice(0, 32), chatId: digest.slice(32, 64) }
+}
+
+/**
+ * 账本的键：签名者身份（URN，跨登录稳定）；读不到才退到会话 id。
+ *
+ * 模块级（与 `accountSessionIds` 同层）—— `readUsageOnce` 在工厂外面，
+ * 需要在同一处算出**与 `checkin` 完全相同**的键，否则额度卡读不到刚签到的赠送。
+ */
+async function ledgerKeyOf(cred) {
+  return accountIdentityOf(cred).id || (await accountSessionIds(cred)).sessionId
 }
 
 // ---- OAuth login: URL + loopback callback ----------------------------------
@@ -3105,6 +3130,20 @@ async function fetchRemoteModels(cred, fetcher, state) {
 }
 
 /**
+ * T-40：`fetchRemoteModels` 的带判据版本 —— 回答问题的不只是「拿到几条」，
+ * 还有「这次到底读到了没有」。
+ *
+ * `regular`：builtin 表这次作答了吗（`Set`，空集也算作答）。它**就是**
+ * `state.regular`，`fetchRemoteModels` 一向用它表达「builtin 已读过」；
+ * 全读失败时保持 `null`。缓存只在它非空时写 —— 一次失败不该被固化成
+ * 「这个网关只有这些模型」。
+ */
+async function fetchRemoteModelsDetailed(cred, fetcher, state) {
+  const models = await fetchRemoteModels(cred, fetcher, state)
+  return { models, regular: state?.regular ?? null }
+}
+
+/**
  * Chinese labels for the credit metric buckets CodeArts reports.
  *
  * ⚠ These strings are **also the routing criterion**: `creditWindow()` decides
@@ -3250,6 +3289,162 @@ function usageFromStatistics(raw, benefitRaw, { batches, grants, benefitIds } = 
 
 // ---- the plugin -------------------------------------------------------------
 
+// ═══ T-40：磁盘缓存（模型目录 / 额度）═══════════════════════════════════════
+//
+// 用户原话（T-39 定的规矩，T-40 覆盖到第二个 provider）：
+//
+//	「所有的东西都需要缓存。更新缓存是我们来控制的，不要自动更新缓存」
+//	「重启项目的时候，我不希望它就会自动去发送什么请求」
+//
+// 改造前：magpie 每重启一次，就对**每个账号**问一次 `provider.models`
+// （`/api/v1/gateway/config` + `/v1/model/builtin` + agent 列表 + agent 详情）
+// 和一次 `auth.usage`（statistics + 免费池 + 两个批次页）—— N 个账号 = 7N 次上游。
+//
+// 改造后：
+//	目录：有缓存 = 0 次；没有 = **网关级 1 次**（模块级单飞，不是账号数）。
+//	额度：0 次（只由登录 / 重新登录写）。
+//
+// 两份文件都带 `codearts-` 前缀：OfficeAce 的 `officeace-*` 两个文件是**另一个
+// 维度**（MaaS 网关 baseUrl / 果办账号），共用条目会把两边的额度混成一份。
+
+/** 模型目录缓存（键 = 网关主机，见 `MODELS_CACHE_KEY`）。 */
+export const MODELS_CACHE_FILE = "codearts-models-cache.json"
+
+/** 额度缓存（键 = 账号身份，见 `usageCacheKeyOf`）。 */
+export const USAGE_CACHE_FILE = "codearts-usage-cache.json"
+
+/**
+ * 目录缓存的键：**网关**维度。
+ *
+ * 目录本来就是网关级资源（builtin 表由 `snap-access` 发布，不按账号变），所以
+ * 5 个账号并发问目录只该打 1 次。账号自己的差异（`free` 标记、`noBenefit`）
+ * 不缓存 —— 命中缓存后仍按**问话的那个账号**的 state 重新渲染（`modelOf`）。
+ */
+const MODELS_CACHE_KEY = SNAP_HOST
+
+/**
+ * 正在飞的那次「拉目录」，**模块级**：同一网关并发只发一次。
+ *
+ * 放在工厂外面是有意的 —— magpie 可能先后建多个插件实例（OpenCode 也是
+ * 一次 load 一个实例），单飞若跟着实例走，重启后同一网关仍会被拉两次。
+ */
+const modelsInFlight = new Map()
+
+/**
+ * 该账号的 state（T-40）。工厂里的 `accountState()` 私有，而
+ * `finalizeCodeArtsSignIn`（跨入口登录）在工厂外面也需要一份才能读额度；
+ * 工厂实例化时把它的 `accountState` 交出来（`accountStateOf = ...`）。
+ *
+ * 没有插件实例时（纯函数调用）退回一个同样形状的空 state：读额度仍然可用，
+ * 只是没有内存里缓过的免费池 / 批次 / agent id。
+ */
+let accountStateOf = (cred) => ({
+  gate: createConcurrencyGate(ACCOUNT_MAX_INFLIGHT), benefit: null, regular: null, noBenefit: new Set(),
+  claim: null, claiming: null, agentId: "", batches: undefined, batchesAt: 0,
+  renewing: null, renewed: null, unconfirmed: null,
+  _key: String(cred?.access_key_id ?? ""),
+})
+
+/**
+ * 登录 / 重新登录这一次用户动作：读一次额度并写缓存（T-40）。
+ *
+ * 为什么非要读一次：码道的登录响应（STS 凭据 / IAM 手机号 / MaaS 字段）里**没有
+ * 任何额度数据**，而 `auth.usage` 从此只读缓存 —— 不在这里写，新账号的卡片就
+ * 只能永远显示「额度未读」。与 OfficeAce 在登录时读一次订阅同构。
+ *
+ * ⚠ 永不抛：登录已经成功，缓存写不上不该让用户看到「登录失败」。
+ * ⚠ 没有 `cacheDir` 时什么都不做（桌面测试 / 嵌入场景不该产生额外请求）。
+ */
+async function rememberUsageOnSignIn(cred, { fetcher, cacheDir, ledgerPath = defaultLedgerPath() } = {}) {
+  if (!cacheDir) return false
+  try {
+    const state = accountStateOf(cred)
+    return writeUsageCache(cacheDir, cred, await readUsageOnce(cred, { fetcher, ledgerPath, state, batches: false }))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 额度缓存的键 = 账号身份（URN）。没有身份（老凭据、导入缺口）才退到 AK。
+ *
+ * 额度是**账号级**资源：两个账号的积分池完全独立，键按网关会把 A 的额度
+ * 显示在 B 的卡片上。白白不同的 provider 也各有各的文件（`codearts-usage-cache`）。
+ */
+export function usageCacheKeyOf(cred) {
+  const identity = accountIdentityOf(cred).id
+  if (identity) return `id:${identity}`
+  const ak = String(cred?.access_key_id ?? "").trim()
+  return ak ? `ak:${ak}` : ""
+}
+
+/**
+ * 实时读一次额度（T-42 前 `auth.usage` 的读法原样搬出来，T-40 抽成函数）。
+ *
+ * 只有两个调用点：① 没有缓存目录时 `auth.usage` 的退路；② **登录 / 重新登录**
+ * 这一次用户动作顺手写缓存。钩子里（有缓存目录时）永远不再走这里。
+ *
+ * 需要调用方已备好的东西：`fetcher`、`ledgerPath`、以及该账号的 `state`
+ * （`accountState()` 的那一份：`benefit` / `batches` / `batchesAt`）。
+ */
+export async function readUsageOnce(cred, { fetcher, ledgerPath, state, batches = true }) {
+  const text = await signedGet(SNAP_STATISTICS_URL, cred, fetcher, SNAP_EXTRA_HEADERS)
+  // T-31: a failed read is a **window** (`说明 · 额度读不到（…）`), not `error`:
+  // `error` replaces the whole window area, so one network hiccup would blank
+  // the card. An aside window still says why, and never takes part in routing.
+  if (text === undefined) return { windows: [unreadableWindow("码道没有返回额度数据")] }
+  // The free pool only once today's benefit is the account's; best effort
+  // either way: a credit account without one is normal.
+  const free = state.benefit === null || state.benefit.size > 0
+  const benefitText = free ? await signedGet(BENEFIT_BALANCE_URL, cred, fetcher) : undefined
+  // Each batch's own expiry, read again every ten minutes (and after a
+  // check-in); a failed read keeps the last one, else the ledger stands in.
+  //
+  // `batches: false`（登录那次读）跳过这两个**只补充到期提示**的页：登录是用户
+  // 动作，能少发就少发；授予账本（本地文件）仍然给出赠送积分的到期时间。
+  if (batches && (!state.batchesAt || Date.now() - state.batchesAt > CREDIT_BATCHES_TTL_MS)) {
+    const read = await fetchCreditBatches(cred, fetcher).catch(() => undefined)
+    if (read) state.batches = read
+    state.batchesAt = Date.now()
+  }
+  const usage = usageFromStatistics(safeJson(text), benefitText === undefined ? undefined : safeJson(benefitText), {
+    batches: state.batches,
+    // 与 `checkin` 写账本用的是**同一个键**（`ledgerKeyOf` = 工厂里 `ledgerKey` 的同源实现），
+    // 否则额度卡读不到刚签到的赠送（`readUsageOnce` 在工厂外，够不到闭包）。
+    grants: readGrants(ledgerPath, await ledgerKeyOf(cred)),
+    benefitIds: state.benefit ? [...state.benefit] : BENEFIT_MODEL_FALLBACK,
+  })
+  // The card names the account by its phone, not by IAM's `hw…` id or its URN —
+  // read once here for an account whose credential predates that read (the next
+  // refresh stores it).
+  const phone = firstOf(cred.user_phone) || (await fetchAccountPhone(cred, fetcher))
+  const user = phone || shortAccountName(cred)
+  return user ? { ...usage, user } : usage
+}
+
+/**
+ * 把一次实时读到的额度写进缓存。
+ *
+ * ⚠ **只由用户动作调用**（登录 / 重新登录）——「更新缓存由我们控制」的落地。
+ *   失败只返回 false，绝不影响登录结果（登录已经成功）。
+ *
+ * 不写的情况：没有权限键、没有窗口、读失败（`error`）—— 把一次失败读成
+ * 「这个号没有额度」比留空更糟。
+ */
+export function writeUsageCache(cacheDir, cred, rendered) {
+  if (!cacheDir) return false
+  const key = usageCacheKeyOf(cred)
+  if (!key) return false
+  if (!rendered || rendered.error) return false
+  if (!Array.isArray(rendered.windows) || rendered.windows.length === 0) return false
+  return writeCacheEntry(cacheDir, USAGE_CACHE_FILE, key, {
+    at: Date.now(),
+    windows: rendered.windows,
+    ...(rendered.plan ? { plan: rendered.plan } : {}),
+    ...(rendered.user ? { user: rendered.user } : {}),
+  })
+}
+
 export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
   const client = _ctx.client
   const fetcher = typeof options?.fetch === "function" ? options.fetch : fetch
@@ -3261,6 +3456,23 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
   const retryBudgetMs = Number.isFinite(options?.retryBudgetMs) ? Math.max(0, options.retryBudgetMs) : SESSION_RETRY_BUDGET_MS
   const retryDelays = Array.isArray(options?.retryDelays) && options.retryDelays.length ? options.retryDelays : SESSION_RETRY_DELAYS_MS
   const queueBudgetMs = Number.isFinite(options?.queueBudgetMs) ? Math.max(0, options.queueBudgetMs) : QUEUE_BUDGET_MS
+  /**
+   * 缓存目录（T-40）。顺序与 OfficeAce 一致：`options.cacheDir`（测试/排障显式
+   * 指定）→ `_ctx.directory`（magpie 注入的配置目录）→ 空 = 关闭缓存。
+   *
+   * ⚠ 为空时钩子退回「实时读」：没有可写的地方就无处缓存，这时让它读一次比让
+   *   用户永远看不到数据更诚实。生产环境 magpie 一定给 `directory`，所以正常
+   *   安装永远走缓存路径（重启零上游）。
+   */
+  const cacheDir = cacheDirOf(options?.cacheDir ?? _ctx?.directory ?? "")
+  /** 缓存只是锦上添花：写不上/读不上最多丢一个行日志，绝不影响钩子结果。 */
+  const log = (message, level = "info") => {
+    try {
+      client?.app?.log?.({ service: "codearts", level, message })
+    } catch {
+      /* 没有日志通道就算了 */
+    }
+  }
   // 登录入口统一走 src/login-method.mjs：默认浏览器；下一期把
   // options.loginMethod = createBuiltinLogin(...) 传进来即可，不用改这里。
   const startLoginFlow =
@@ -3335,6 +3547,10 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
     return accounts.get(key)
   }
   const stateOf = async (cred) => accountState((await accountSessionIds(cred)).sessionId)
+  // T-40：`finalizeCodeArtsSignIn` 在工厂外面，也要一份该账号的 state 才能读额度
+  // （免费池 / 批次 / 授予账本）。会话 id 是哈希（同步算不出来），所以这里按
+  // 身份退一步 —— 同一个账号，只是 session id 不同。
+  accountStateOf = (cred) => accountState(`id:${accountIdentityOf(cred).id || cred?.access_key_id || ""}`)
 
   // One renewal per refresh token, whoever asks for it (each of the account's
   // loaders, magpie's auth.refresh): STS spends a refresh token once, so a
@@ -3359,7 +3575,7 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
     return state.renewing.promise
   }
   // The ledger's key: the signer, which outlives a sign-in; else the session.
-  const ledgerKey = async (cred) => accountIdentityOf(cred).id || (await accountSessionIds(cred)).sessionId
+  const ledgerKey = (cred) => ledgerKeyOf(cred)
 
   const configModel = (m) => ({
     name: m.name ?? m.id,
@@ -3407,6 +3623,88 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
     }
   }
 
+  // ═══ T-40：缓存读写（目录 / 额度）══════════════════════════════════════
+  //
+  // 判据一句话：magpie 重启后逐账号问 `provider.models` / `auth.usage`，
+  // **会不会对每个账号各打一次上游？** 改造后：目录 0 次（有缓存）/ 1 次
+  // （没缓存，网关级）；额度 0 次（只读缓存，永远）。
+
+  /** 缓存里的目录条目（形状不对就当没有缓存：缓存文件是给人删的）。 */
+  const cachedModelList = (hit) => {
+    if (!hit || !Array.isArray(hit.list)) return null
+    const list = hit.list.filter((m) => m && typeof m === "object" && typeof m.id === "string" && m.id)
+    return list.length ? list : null
+  }
+
+  /** 缓存的事实 → magpie 的模型表（`free` 仍按**问话账号**的 state 重算）。 */
+  const renderModels = (provider, list, state) =>
+    Object.fromEntries(list.filter((m) => m && m.id).map((m) => [m.id, modelOf(provider, m, state)]))
+
+  /**
+   * 拉一次目录（网关级单飞），成功后写缓存。
+   *
+   * 失败（抛错 / 空表）一律**不写缓存**：写进去就等于把「拉不到」固化成
+   * 「这个网关只有这些模型」，而下次启动本该重试。
+   */
+  async function loadModelsOnce(cred, state) {
+    const id = `${cacheDir}::${MODELS_CACHE_KEY}`
+    const running = modelsInFlight.get(id)
+    if (running) return running
+
+    const task = (async () => {
+      // `remote.regular` = builtin 表这次真的作答了（哪怕一条都没有）—— 那才是
+      // 「拉到了」。全失败时它保持 null，调用方回退静态表且不写缓存。
+      const remote = await fetchRemoteModelsDetailed(cred, fetcher, state)
+      if (!remote.regular) return []
+      const ok = writeCacheEntry(cacheDir, MODELS_CACHE_FILE, MODELS_CACHE_KEY, {
+        at: Date.now(),
+        host: SNAP_HOST,
+        list: remote.models,
+      })
+      if (!ok) log("目录缓存写入失败（下次启动会再拉一次）", "warn")
+      return remote.models
+    })().finally(() => {
+      if (modelsInFlight.get(id) === task) modelsInFlight.delete(id)
+    })
+
+    modelsInFlight.set(id, task)
+    return task
+  }
+
+  /**
+   * 实时读一次额度（`readUsageOnce` + 本账号的 state）。
+   *
+   * 只有两个调用点：① 没有缓存目录时 `auth.usage` 的退路；② **登录 / 重新登录**
+   * 这一次用户动作顺手写缓存。钩子里（有缓存目录时）永远不再走这里。
+   */
+  const readUsageLive = async (cred) =>
+    readUsageOnce(cred, { fetcher, ledgerPath, state: await stateOf(cred) })
+
+  /**
+   * 登录成功后顺手读一次额度并写缓存（用户动作，不是后台）。
+   *
+   * ⚠ 永不抛：登录已经成功，缓存写不上不该让用户看到「登录失败」。
+   *
+   * 为什么非要读一次：码道的登录响应（STS 凭据 / IAM 手机号 / MaaS 字段）里
+   * **没有任何额度数据**，而 `auth.usage` 从此**只读缓存** —— 不在这里写，新账号
+   * 的卡片就只能永远显示「额度未读」。与 OfficeAce 在登录时读一次订阅同构。
+   */
+  async function rememberUsageFromLogin(cred) {
+    if (!cacheDir) return false
+    try {
+      return writeUsageCache(cacheDir, cred, await readUsageOnce(cred, {
+        fetcher,
+        ledgerPath,
+        state: await stateOf(cred),
+        // 登录只读 statistics + 免费池，不读两个「到期提示」页（能少发就少发）。
+        batches: false,
+      }))
+    } catch (e) {
+      log(`登录后读额度失败（不影响登录）：${e?.message ?? e}`, "warn")
+      return false
+    }
+  }
+
   return {
     // The provider and the models it has before anyone is signed in.
     config: async (config) => {
@@ -3422,6 +3720,19 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
     // The account's own list when signed in and CodeArts answers.
     provider: {
       id: PROVIDER,
+      /**
+       * T-40：**先读缓存**。
+       *
+       * magpie 每重启一次就对每个账号问一次这个钩子，改造前每个账号都要打
+       * 4 个端点（gateway/config、model/builtin、agents、agents/detail）。
+       *
+       *	① 命中 `codearts-models-cache.json` → 直接返回（零上游）
+       *	② 未命中 → 整个网关**只拉一次**（模块级单飞，N 个账号也只 1 次）→ 写缓存
+       *	③ 拉失败 → 回退静态表，**不写缓存**（下次启动重试）
+       *
+       * ⚠ 没有缓存目录（测试/嵌入）时保持原来的实时路径：没地方缓存时，让它读
+       *   一次比让用户永远看不到模型更诚实。
+       */
       async models(provider, { auth } = {}) {
         const cred = credentialOf(auth)
         if (!cred?.access_key_id) {
@@ -3431,11 +3742,31 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
         }
         const identity = accountIdentityOf(cred).id
         if (identity) noteProviderAccount(PROVIDER, identity)
+
+        if (cacheDir) {
+          // ① 缓存命中：零上游。`stateOf` 只是哈希，不发请求。
+          const hit = cachedModelList(readCacheEntry(cacheDir, MODELS_CACHE_FILE, MODELS_CACHE_KEY))
+          if (hit) {
+            const state = await stateOf(cred)
+            return renderModels(provider, hit, state)
+          }
+
+          // ② 未命中：网关级单飞拉一次 → 写缓存
+          try {
+            const state = await stateOf(cred)
+            const list = await loadModelsOnce(cred, state)
+            if (!list.length) return provider.models
+            return renderModels(provider, list, state)
+          } catch {
+            return provider.models
+          }
+        }
+
         try {
           const state = await stateOf(cred)
           const list = await fetchRemoteModels(cred, fetcher, state)
           if (!list.length) return provider.models
-          return Object.fromEntries(list.map((m) => [m.id, modelOf(provider, m, state)]))
+          return renderModels(provider, list, state)
         } catch {
           return provider.models
         }
@@ -3460,9 +3791,28 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
       options: [INVITE_MODE_OPTION],
 
       // magpie's own hook: renew the temporary credentials before they expire.
+      /**
+       * T-40：**严格「已过期才续」** —— 任务书第 4 条。
+       *
+       * `refreshLead` 同时改成 0（见常量注释）：magpie 只在 `expires` **到点之后**
+       * 才来问续期；宿主忽略 `refreshLead`（OpenCode）或照旧提前问时，这里再兜
+       * 一层：没过期就返回 `undefined`，**一个请求都不发**。
+       *
+       * 为什么这样不会把号弄掉线：STS 过期的那一刻，下一次真实请求会走到 loader
+       * 的 `renewCredential`（`nearExpiry` 的 2 分钟窗口 + 401 重签），续期由
+       * **真实流量**触发 —— 而不是由 magpie 重启触发。
+       *
+       * ⚠ 未知过期时间（老凭据 / 导入缺口）仍然续：那才是真的「可能随时过期」。
+       */
       async refresh(auth) {
         const cred = credentialOf(auth)
         if (!cred) return undefined
+        // T-41：**走完总有效期的 50% 才续**（会话 JWT 的 iat/exp）。没过半 ⇒ 零请求。
+        // ⚠ 这里**不是**「STS 没过期就不续」：STS 只有 ~1 小时，用它当闸门会让会话
+        //   永远卡在「STS 过期但会话还有 27 天」的错位里 —— 判据只看会话 JWT。
+        // 解不出 JWT 时照旧续（老凭据兜底）。
+        const claims = readJwtClaims(cred.refresh_token)
+        if (claims && !pastHalfLife(claims.iat, claims.exp)) return undefined
         const renewed = await renewOnce(cred)
         // A rotation rebuilds the credential: keep the phone, which only the
         // stored one knows (`renewOnce` carries `session_id` itself), and read
@@ -3570,47 +3920,26 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
       },
 
       // magpie's own hook: how much of the plan is left.
+      /**
+       * ⚠ 每次被 magpie 问就真读一次上游（**不做缓存**）。
+       *
+       * 用户裁决（T-42）：「那个 usage 这些也不要改」—— T-40 曾改成只读缓存 +
+       * `说明 · 额度未读`，已回滚。可以缓存的只有 `provider.models`。
+       */
       async usage(getAuth) {
         const auth = await getAuth()
         const cred = credentialOf(auth)
         if (!cred?.access_key_id) return { error: "not signed in", windows: [] }
         const identity = accountIdentityOf(cred).id
         if (identity) noteProviderAccount(PROVIDER, identity)
+
         try {
-          const text = await signedGet(SNAP_STATISTICS_URL, cred, fetcher, SNAP_EXTRA_HEADERS)
-          // T-31: a failed read is a **window** (`说明 · 额度读不到（…）`), not `error`:
-          // `error` replaces the whole window area, so one network hiccup would blank
-          // the card. An aside window still says why, and never takes part in routing.
-          if (text === undefined) return { windows: [unreadableWindow("码道没有返回额度数据")] }
-          const state = await stateOf(cred)
-          // The free pool only once today's benefit is the account's; best
-          // effort either way: a credit account without one is normal.
-          const free = state.benefit === null || state.benefit.size > 0
-          const benefitText = free ? await signedGet(BENEFIT_BALANCE_URL, cred, fetcher) : undefined
-          // Each batch's own expiry, read again every ten minutes (and after a
-          // check-in); a failed read keeps the last one, else the ledger stands in.
-          if (!state.batchesAt || Date.now() - state.batchesAt > CREDIT_BATCHES_TTL_MS) {
-            const read = await fetchCreditBatches(cred, fetcher).catch(() => undefined)
-            if (read) state.batches = read
-            state.batchesAt = Date.now()
-          }
-          const usage = usageFromStatistics(safeJson(text), benefitText === undefined ? undefined : safeJson(benefitText), {
-            batches: state.batches,
-            grants: readGrants(ledgerPath, await ledgerKey(cred)),
-            benefitIds: state.benefit ? [...state.benefit] : BENEFIT_MODEL_FALLBACK,
-          })
-          // The card names the account by its phone, not by IAM's `hw…` id or
-          // its URN — read once here for an account whose credential predates
-          // that read (the next refresh stores it).
-          const phone = firstOf(cred.user_phone) || (await fetchAccountPhone(cred, fetcher))
-          const user = phone || shortAccountName(cred)
-          return user ? { ...usage, user } : usage
+          return await readUsageLive(cred)
         } catch (e) {
           // T-31: same reason as above — report the failed read as an aside window.
           return { windows: [unreadableWindow(String(e?.message ?? e).slice(0, 80))] }
         }
       },
-
       // magpie's own hook: the daily 「每日领取」 check-in (OpenCode ignores it).
       // magpie renews the sign-in before asking, and asks once a Beijing day.
       async checkin(getAuth) {
@@ -3712,6 +4041,10 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
                   // token would sign each other out; the other card has its own
                   // sign-in and its own token.
                   await writeSharedRecord(client, PROVIDER, withMaas, fetcher)
+                  // T-40：登录 = 用户动作 ⇒ 顺手读一次额度并写缓存（码道登录的
+                  // 响应里没有额度，而 `auth.usage` 从此只读缓存；详见
+                  // `rememberUsageFromLogin`。永不影响登录结果。）
+                  await rememberUsageFromLogin(withMaas)
                   return record
                 } catch (e) {
                   return { type: "failed", error: e?.message ?? String(e) }
@@ -3797,6 +4130,8 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
                   const withMaas = await withOfficeAceMaas(identified, fetcher)
                   record = successOf(withMaas, outcome.expires)
                   await writeSharedRecord(client, PROVIDER, withMaas, fetcher)
+                  // T-40：同上 —— 登录这一次用户动作顺手写额度缓存。
+                  await rememberUsageFromLogin(withMaas)
                 } catch (e) {
                   await closeFirst()
                   return { type: "failed", error: e?.message ?? String(e) }
@@ -3944,7 +4279,8 @@ export const _internal = {
   snapRequest, dailyCheckin,
   parseModelInfo, extractArray, fetchRemoteModels, dedupeAliases, shortAccountName, creditWindow, benefitWindow, usageFromStatistics,
   upstreamCapabilities, pickUpstreamCapabilities,
-  finalizeCodeArtsSignIn, finalizeOfficeAceSignIn, noteProviderAccount, recordKeyFor,
+  finalizeCodeArtsSignIn, finalizeOfficeAceSignIn, noteProviderAccount, recordKeyFor, usageCacheKeyOf,
+  readUsageOnce, writeUsageCache,
 }
 
 
@@ -4799,7 +5135,16 @@ async function writeSharedRecord(client, target, cred, fetcher = fetch) {
   return { key, body }
 }
 
-export async function finalizeCodeArtsSignIn(client, cred, fetcher = fetch) {
+/**
+ * Write a signed-in account as this provider's record, and (T-40) the usage cache
+ * beside it.
+ *
+ * `options.cacheDir` is the plugin's cache directory (the caller passes it so a
+ * sign-in taken through *another* provider's entry — the one-code dual login —
+ * still leaves an amount for this card to show). Without it nothing is cached:
+ * the record is still written.
+ */
+export async function finalizeCodeArtsSignIn(client, cred, fetcher = fetch, { cacheDir = "" } = {}) {
   if (!cred || typeof cred !== "object" || typeof cred.access_key_id !== "string" || !cred.access_key_id) {
     return { credential: cred ?? null, written: false, reason: "invalid-credential" }
   }
@@ -4807,6 +5152,10 @@ export async function finalizeCodeArtsSignIn(client, cred, fetcher = fetch) {
   const enriched = await withOfficeAceMaas(identified, fetcher)
   const identity = accountIdentityOf(enriched).id
   if (!identity) return { credential: enriched, written: false, reason: "no-identity" }
+  // T-40：额度缓存与「这次有没有写出新记录」无关 —— 重新登录一个已有账号时
+  // `recordKeyFor` 会回 `exists`（不覆盖），但凭据是好的，额度这次读过就该记下来。
+  // 写在这里而不是写在最后，就是为了让 `exists` / `write-failed` 也有额度可看。
+  await rememberUsageOnSignIn(enriched, { fetcher, cacheDir })
   if (!recordKeyFor(PROVIDER, identity)) return { credential: enriched, written: false, reason: "exists" }
   const record = await writeSharedRecord(client, PROVIDER, enriched, fetcher)
   if (!record) return { credential: enriched, written: false, reason: "write-failed" }

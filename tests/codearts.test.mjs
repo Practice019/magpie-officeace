@@ -26,6 +26,40 @@ test.after(() => fs.rmSync(ledgerDir, { recursive: true, force: true }))
 
 const buf = (s) => new TextEncoder().encode(s)
 
+// ---- usage is read live: the hook asks the vendor on every call --------------
+//
+// `auth.usage` only reads `codearts-usage-cache.json` when the plugin was given
+// a directory. A case that wants to see *what the read produced* writes the
+// cache first, the way 「重新登录」 does (one user action = one read + one write).
+
+/** A fresh, empty cache directory of its own (never a plugin's default). */
+const NO_CACHE_DIRS = []
+function noCacheDir() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codearts-nocache-"))
+  NO_CACHE_DIRS.push(dir)
+  return dir
+}
+test.after(() => {
+  for (const dir of NO_CACHE_DIRS) fs.rmSync(dir, { recursive: true, force: true })
+})
+
+/** A state of the shape `readUsageOnce` expects (nothing read yet). */
+const blankUsageState = () => ({ benefit: null, batches: undefined, batchesAt: 0, noBenefit: new Set() })
+
+/** Counts calls to the vendor's usage endpoints; anything there is a failure. */
+function stubOtherUsageUpstream() {
+  const real = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async (url, init) => {
+    if (/snap-manager|ops\/credit|benefit\/balance|package\/credit/.test(String(url))) {
+      calls += 1
+      throw new Error("T-40：额度钩子不许自己打上游")
+    }
+    return real(url, init)
+  }
+  return () => calls
+}
+
 // ---- chat endpoint pin (anti-regression) -----------------------------------
 //
 // Fixed to the literal, NOT compared against another constant: the point is
@@ -504,12 +538,12 @@ test('fetchAccountPhone is best effort — no claim, a refusal, or no number giv
 
 test("usage names an account by the phone its credential carries", async () => {
   const cred = { ...(await makeCred()), user_phone: "138****8000" }
-  const plugin = await CodeArtsAuthPlugin({ client: {} }, {
-    fetch: async () => new Response(JSON.stringify({ metrics: [
-      { name: "usageTotalPackageCredit", package_credit_amount: 500, package_credit_remain: 500 },
-    ] }), { status: 200 }),
-    ledgerPath: path.join(ledgerDir, "unused.json"),
-  })
+  // usage 不做缓存：钩子每次被问都真读一次上游。
+  const fetcher = async () => new Response(JSON.stringify({ metrics: [
+    { name: "usageTotalPackageCredit", package_credit_amount: 500, package_credit_remain: 500 },
+  ] }), { status: 200 })
+  const ledgerPath = path.join(ledgerDir, "unused.json")
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, ledgerPath })
   const usage = await plugin.auth.usage(async () => makeAuth(cred))
   assert.equal(usage.user, "138****8000")
   assert.equal(usage.windows.length > 0, true, "the phone must not replace the windows")
@@ -758,7 +792,8 @@ test("usage with the vendor's batches: the plan's end is the reset, the grants' 
     if (String(url) === x.BENEFIT_BALANCE_URL) return new Response("", { status: 404 })
     return credit(url, init)
   }
-  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, ledgerPath: path.join(ledgerDir, "unused.json") })
+  const ledgerPath = path.join(ledgerDir, "unused.json")
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, ledgerPath })
   const usage = await plugin.auth.usage(async () => makeAuth(cred))
   const [total, basic, bonus] = usage.windows
   // To the second, from the plan's batch, not end_date's day.
@@ -2118,11 +2153,14 @@ test("two loaders of one account and magpie's own renewal spend its refresh toke
     return /Access=AK,/.test(new Headers(init.headers).get("authorization")) ? new Response(staleBody, { status: 401 }) : sseResponse(okStream)
   }
   const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  // T-40：`auth.refresh` 现在**严格「已过期才续」**，所以这条用例的凭据要真的
+  // 过期（上面那些 loader 的重签走的是 401 路径，和这个闸无关）。
+  const expired = { ...cred, expires_at: new Date(Date.now() - 60_000).toISOString() }
   // Nothing is stored meanwhile: every read gives the old record.
   const getAuth = async () => makeAuth(cred)
   const loaders = await Promise.all([plugin.auth.loader(getAuth), plugin.auth.loader(getAuth)])
   const answers = Promise.all(loaders.map((l) => l.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))))
-  const refreshed = plugin.auth.refresh(makeAuth(cred))
+  const refreshed = plugin.auth.refresh(makeAuth(expired))
   while (sts < 1) await new Promise((r) => setTimeout(r, 5))
   await new Promise((r) => setTimeout(r, 20))
   release()
@@ -2132,7 +2170,7 @@ test("two loaders of one account and magpie's own renewal spend its refresh toke
   }
   assert.equal(JSON.parse((await refreshed).access).access_key_id, "AK2")
   // One that comes later with the spent token gets what the renewal gave.
-  assert.equal(JSON.parse((await plugin.auth.refresh(makeAuth(cred))).access).access_key_id, "AK2")
+  assert.equal(JSON.parse((await plugin.auth.refresh(makeAuth(expired))).access).access_key_id, "AK2")
   assert.equal(sts, 1)
 })
 
@@ -2286,7 +2324,17 @@ test("auth.refresh exchanges the refresh token for fresh credentials", async () 
     }), { status: 200 })
   }
   const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
-  const next = await plugin.auth.refresh(makeAuth(cred))
+  // T-41：续期闸门改成「走完会话总有效期的 50%」——没过半就不发请求、原样返回，
+  // 过半才真去 STS 换。这里的会话 JWT：签发 = 现在，有效期 1 天。
+  const now = Math.floor(Date.now() / 1000)
+  const session = (iat, exp) =>
+    `h.${Buffer.from(JSON.stringify({ iat, exp, user_profile: JSON.stringify({ principal_urn: "iam::d:user:hw1" }) })).toString("base64url")}.s`
+  // ① 刚签发（剩 100%）：零请求
+  const fresh = { ...cred, refresh_token: session(now - 60, now - 60 + 86_400) }
+  assert.equal(await plugin.auth.refresh(makeAuth(fresh)), undefined)
+  // ② 已走完一半：真续（1 次 STS）
+  const past = { ...cred, refresh_token: session(now - 43_200 - 60, now + 43_200 - 60) }
+  const next = await plugin.auth.refresh(makeAuth(past))
   const parsed = JSON.parse(next.access)
   assert.equal(parsed.access_key_id, "AK2")
   assert.equal(next.refresh, "R2")
@@ -2623,6 +2671,7 @@ test("a claimed check-in is kept, and the usage card says when those credits run
   assert.equal(grant.credit, 1000)
   assert.equal(Date.parse(grant.expiresAt) - Date.parse(grant.at), 30 * 86_400_000)
 
+  // usage 真实读上游（不做缓存）：签到后那张卡上就该看到这笔赠送的到期时间。
   const usage = await plugin.auth.usage(async () => makeAuth(cred))
   const bonus = usage.windows.find((w) => w.name === "额度 · 赠送积分包")
   assert.equal(bonus.runsOutAt, grant.expiresAt)
@@ -3019,15 +3068,18 @@ test("auth.refresh keeps a named account's identity and gives an unnamed one the
     }), { status: 200 })
   const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
 
+  // T-40：`auth.refresh` 严格「已过期才续」—— 这条用例看的是续期后的身份字段，
+  // 所以凭据必须真过期（未过期就零上游那一半由 `auth.refresh exchanges …` 覆盖）。
+  const expired = { ...cred, expires_at: new Date(Date.now() - 60_000).toISOString() }
   // an account that has an accountId: a renewal does not rename it
-  const named = await plugin.auth.refresh({ ...makeAuth(cred), accountId: urn })
+  const named = await plugin.auth.refresh({ ...makeAuth(expired), accountId: urn })
   assert.equal(named.accountId, undefined)
   // the phone is read on the renewal and kept on the credential
   assert.equal(JSON.parse(named.access).user_phone, "138****8000")
 
   // an account without one: the renewal gives it the URN (else a re-sign-in
   // would add a second row)
-  const unnamed = await plugin.auth.refresh(makeAuth(cred))
+  const unnamed = await plugin.auth.refresh(makeAuth(expired))
   assert.match(String(unnamed.accountId ?? ""), /^iam::/)
   assert.equal(JSON.parse(unnamed.access).user_phone, "138****8000")
 })

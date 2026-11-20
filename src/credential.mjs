@@ -9,6 +9,7 @@
 //   {
 //     "type": "oauth",
 //     "access": "<JSON 字符串，见下>",
+import { readJwtClaims } from "./token-life.mjs"
 //     "refresh": "<华为云 STS refresh_token，JWT>",
 //     "expires": 1792841892266,
 //     "accountId": "0123456789abcdef0123456789abcdef"
@@ -138,15 +139,27 @@ export function toStored(cred, prev) {
     // magpie 的 refreshLead 机制读这个字段
     refresh: cred.refreshToken ?? "",
     // 卡片显示名：手机号（IAM 读到的，已打码）优先；取不到才用 accountId。
-    // ⚠ accountId 是华为云的 domain id（`01234567…`），当名字显示就是「乱码」
     accountId: cred.user_phone || cred.accountId || "",
     // 厂商自己的 id（区分同名账号）—— 身份永远在 uid，不在 accountId
     uid: cred.accountId ?? "",
   }
 }
 
-/** 凭据到期时间（毫秒）。解析不出来时保守给 1 小时后。 */
+/**
+ * 凭据到期时间（毫秒）—— **写进 magpie `expires` 的那个值**。
+ *
+ * # T-41：必须是**真实会话期限**，不是 STS 的短期限
+ *
+ * 真机实测：`expiresAt`（华为云 STS）只有 ~1 小时，而会话 JWT 还有 ~27 天。
+ * 旧实现把 STS 期限写进 `expires` ⇒ magpie 每轮都判「该续期」⇒ 反复 `auth.refresh`
+ * （日志里成片的「续期失败」就是这么来的）。
+ *
+ * 现在：① 会话 JWT 的 `exp`（毫秒）优先；② 解不出 JWT 才用 STS 的 `expiresAt`；
+ * ③ 都没有就保守 1 小时。
+ */
 export function expiryMs(cred) {
+  const claims = readJwtClaims(cred?.refreshToken ?? cred?.refresh_token)
+  if (claims) return claims.exp * 1000
   const at = Date.parse(cred?.expiresAt ?? "")
   return Number.isFinite(at) ? at : Date.now() + 60 * 60 * 1000
 }
