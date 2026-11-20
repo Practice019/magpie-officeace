@@ -53,7 +53,10 @@ import { UA } from "../constants.mjs"
 // 模型能力**只在一处映射**（与 OfficeAce 那条 provider 共用同一个函数）：
 // 上游给了什么能力就说什么，没给就是纯文本。
 import { upstreamCapabilities, pickUpstreamCapabilities } from "../models.mjs"
-import { ImportError, importFields, makeImportHook, validateImportDpop, validateImportExpiry, validateImportMaas, validateImportVerifier } from "../importer.mjs"
+import { QUOTA_PREFIX, unreadableWindow } from "../window-names.mjs"
+import { ImportError, importFields, makeCollector, makeImportHook, validateImportDpop, validateImportExpiry, validateImportMaas, validateImportVerifier } from "../importer.mjs"
+import { makePasteImportMethod } from "../paste-import.mjs"
+import { officeAceAuthFile } from "../accounts.mjs"
 import { beginLogin as beginOfficeAceLogin } from "../login.mjs"
 import { launchIsolatedLogin } from "../isolated-login.mjs"
 import { confirmInviteByCode, ensureInviteCode, noteAccount, resolveInviteCode, syncAccounts } from "./invite.mjs"
@@ -61,6 +64,30 @@ import { confirmInviteByCode, ensureInviteCode, noteAccount, resolveInviteCode, 
 const PROVIDER = "codearts"
 const INVITE_MODE_KEY = "invite_mode"
 const INVITE_INPUT_KEY = "invite"
+
+/**
+ * The one switch CodeArts declares (`auth.options`), lifted out so tests can
+ * assert its shape without building the whole plugin.
+ *
+ * Shape rules it must satisfy (`optionsOf()` in `host-acc034d984c6.js`):
+ * `key` `^[a-z0-9_-]{1,40}$`, `label` non-empty and ≤60, `default` a boolean
+ * (anything but `true` reads as off), optional `labels`/`descriptions` maps
+ * (≤16 entries, each ≤300 chars), `placement:"top"` to sit under the accounts.
+ */
+export const INVITE_MODE_OPTION = Object.freeze({
+  key: INVITE_MODE_KEY,
+  label: "邀请模式",
+  description:
+    "关闭时自动使用最新注册账号的邀请链接（最新还没码则生成，失败回退上一个可用账号，都没有才用你预留的邀请码）；" +
+    "开启时使用 magpie 账号页的首选账号（账号行「Make first」）作为邀请源，仅新注册账号可建立邀请关系。",
+  labels: { zh: "邀请模式", en: "Invite mode" },
+  descriptions: {
+    zh: "关闭时自动使用最新注册账号的邀请链接；开启时只使用 magpie 首选账号（Make first）。没有可用链接时回退预留邀请码，仅新注册账号可建立邀请关系。",
+    en: "Off: use the newest account's invite link, falling back to an older usable account and then your reserved code. On: use only the magpie Make first account. Invitations apply only to new registrations.",
+  },
+  default: false,
+  placement: "top",
+})
 
 // 码道 CodeArts 的方形标志（由 OfficeAce 客户端自带素材裁切，128×128 PNG）
 const CODEARTS_ICON =
@@ -747,7 +774,8 @@ function normalizeCodeArtsImport(row) {
   }
 }
 
-const codeArtsImport = makeImportHook({
+/** CodeArts 的导入配置：`auth.import`（文件）与「从文件导入（粘贴）」**共用这一份**。 */
+const codeArtsImportOptions = {
   provider: PROVIDER,
   label: "码道 CodeArts",
   clientId: CLIENT_ID,
@@ -770,7 +798,18 @@ const codeArtsImport = makeImportHook({
     if (!cred) throw new ImportError("CodeArts 凭据结构无效")
     return successOf(cred)
   },
-})
+}
+
+const codeArtsImport = makeImportHook(codeArtsImportOptions)
+
+/**
+ * 同一个 CodeArts 解析器的另一个入口：登录弹窗里「从文件导入（粘贴）」。
+ *
+ * ⚠ 只用上面这份配置（`normalizeCodeArtsImport` + 自己的 `toResult`），
+ *   **不借 OfficeAce 的解析器** —— 两个 provider 的字段名完全不同
+ *   （`access_key_id` vs `access`），串用会把一方合法行判成坏行。
+ */
+const collectCodeArtsImport = makeCollector(codeArtsImportOptions)
 
 /** POST the STS token endpoint with a DPoP proof; `label` is the card that asked. */
 async function requestToken(body, keyPair, fetcher, label = "CodeArts") {
@@ -3065,12 +3104,20 @@ async function fetchRemoteModels(cred, fetcher, state) {
   return dedupeAliases(models, benefitSet)
 }
 
-/** Chinese labels for the credit metric buckets CodeArts reports. */
+/**
+ * Chinese labels for the credit metric buckets CodeArts reports.
+ *
+ * ⚠ These strings are **also the routing criterion**: `creditWindow()` decides
+ * `aside` by comparing the window name with
+ * `CREDIT_METRIC_LABELS[TOTAL_CREDIT_METRIC]`, and `usageFromStatistics` sorts
+ * by the same constant. Renaming one here renames both sides at once — that is
+ * deliberate (T-31): never hard-code the label anywhere else.
+ */
 const CREDIT_METRIC_LABELS = {
-  usageTotalPackageCredit: "总积分",
-  usageBasicPackageCredit: "基础积分包",
-  usageOnDemandPackageCredit: "按需积分包",
-  usageBonusPackageCredit: "赠送积分包",
+  usageTotalPackageCredit: `${QUOTA_PREFIX}总积分`,
+  usageBasicPackageCredit: `${QUOTA_PREFIX}基础积分包`,
+  usageOnDemandPackageCredit: `${QUOTA_PREFIX}按需积分包`,
+  usageBonusPackageCredit: `${QUOTA_PREFIX}赠送积分包`,
 }
 const TOTAL_CREDIT_METRIC = "usageTotalPackageCredit"
 
@@ -3082,7 +3129,7 @@ function formatCredit(n) {
   return String(Math.round(v))
 }
 
-const BENEFIT_WINDOW_LABEL = "免费额度"
+const BENEFIT_WINDOW_LABEL = `${QUOTA_PREFIX}免费额度`
 
 /**
  * A credit bucket as a usage window. magpie takes its routing cap from every
@@ -3225,6 +3272,9 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
       ? options.officeAceLoginTimeoutMs
       : 3 * 60_000
   const thinking = options?.thinking !== false
+  // magpie 保存账号的那个文件（只读；见 src/accounts.mjs）。导入去重与分配新键都读它。
+  // 测试可注入；没有注入时与其它 provider 同一个路径规则。
+  const codeArtsAuthFile = officeAceAuthFile({ file: options?.authFile })
   const ledgerPath = typeof options?.ledgerPath === "string" && options.ledgerPath ? options.ledgerPath : defaultLedgerPath()
   // Test hooks: the clock and the sleep the retry budget runs on.
   const now = typeof options?.now === "function" ? options.now : Date.now
@@ -3401,22 +3451,13 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
       // The gateway's own cap: more in flight only queues in the plugin.
       maxConcurrency: maxInflight,
 
-      options: [
-        {
-          key: INVITE_MODE_KEY,
-          label: "邀请模式",
-          description:
-            "关闭时自动使用最新注册账号的邀请链接（最新还没码则生成，失败回退上一个可用账号，都没有才用你预留的邀请码）；" +
-            "开启时使用 magpie 账号页的首选账号（账号行「Make first」）作为邀请源，仅新注册账号可建立邀请关系。",
-          labels: { zh: "邀请模式", en: "Invite mode" },
-          descriptions: {
-            zh: "关闭时自动使用最新注册账号的邀请链接；开启时只使用 magpie 首选账号（Make first）。没有可用链接时回退预留邀请码，仅新注册账号可建立邀请关系。",
-            en: "Off: use the newest account's invite link, falling back to an older usable account and then your reserved code. On: use only the magpie Make first account. Invitations apply only to new registrations.",
-          },
-          default: false,
-          placement: "top",
-        },
-      ],
+      // The switches magpie draws in the provider editor (magpie's own field, T-32).
+      // Shape is copied from `optionsOf()` in `host-acc034d984c6.js` (≈2360-2382):
+      // {key, label, description?, default?, confirm?, labels?, descriptions?,
+      //  confirms?, filtersModels?, placement?}. key must be ^[a-z0-9_-]{1,40}$
+      // (lowercase only — `invite_mode` qualifies), label is required, and
+      // `default` only counts when it is `=== true` (a switch, not a picker).
+      options: [INVITE_MODE_OPTION],
 
       // magpie's own hook: renew the temporary credentials before they expire.
       async refresh(auth) {
@@ -3537,7 +3578,10 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
         if (identity) noteProviderAccount(PROVIDER, identity)
         try {
           const text = await signedGet(SNAP_STATISTICS_URL, cred, fetcher, SNAP_EXTRA_HEADERS)
-          if (text === undefined) return { error: "CodeArts answered an error", windows: [] }
+          // T-31: a failed read is a **window** (`说明 · 额度读不到（…）`), not `error`:
+          // `error` replaces the whole window area, so one network hiccup would blank
+          // the card. An aside window still says why, and never takes part in routing.
+          if (text === undefined) return { windows: [unreadableWindow("码道没有返回额度数据")] }
           const state = await stateOf(cred)
           // The free pool only once today's benefit is the account's; best
           // effort either way: a credit account without one is normal.
@@ -3562,7 +3606,8 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
           const user = phone || shortAccountName(cred)
           return user ? { ...usage, user } : usage
         } catch (e) {
-          return { error: e?.message ?? String(e), windows: [] }
+          // T-31: same reason as above — report the failed read as an aside window.
+          return { windows: [unreadableWindow(String(e?.message ?? e).slice(0, 80))] }
         }
       },
 
@@ -3808,6 +3853,16 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
             }
           },
         },
+        // ③ 登录弹窗里的导入入口：与 OfficeAce 的同名按钮一致（导入按钮必须在
+        // 「用哪种方式登录」弹窗里，供应商详情页把账号全列出来后翻不到最底下）。
+        // 解析/校验复用本 provider 自己的 `collectCodeArtsImport`。
+        makePasteImportMethod({
+          provider: PROVIDER,
+          authFile: codeArtsAuthFile,
+          client,
+          log: (message, level) => client?.app?.log?.({ service: "codearts", level: level ?? "info", message }),
+          collect: collectCodeArtsImport,
+        }),
       ],
     },
   }
@@ -4405,7 +4460,8 @@ async function fetchOfficeAceUsage(cred, fetcher = fetch) {
       const expired = expiresAt !== null && !isTrial && new Date(expiresAt).getTime() <= nowMs
       if (!plan && typeof sku.sku_name === "string") plan = sku.sku_name
       windows.push(officeAceWindow({
-        name: `${sku.sku_name ?? "套餐"} · 剩 ${round(remaining)}`,
+        // T-31: no "· 剩 N" in the name — amount/limit already say it.
+        name: `${QUOTA_PREFIX}${sku.sku_name ?? "套餐"}`,
         used: Math.min(100, Math.max(0, Math.round((used / total) * 100))),
         // a `.trial` sku carries no expiry: nothing to invent
         resetsAt: isTrial || expiresAt === null ? "" : new Date(expiresAt).toISOString(),
@@ -4426,7 +4482,8 @@ async function fetchOfficeAceUsage(cred, fetcher = fetch) {
     const expiresAt = typeof bonus.expired_time === "string" ? bonus.expired_time : null
     const expired = expiresAt !== null && new Date(expiresAt).getTime() <= nowMs
     windows.push(officeAceWindow({
-      name: `${bonus.activity_name ?? "活动奖励"} · 剩 ${round(remaining)}`,
+      // T-31: same as the sku buckets — the name is the bucket, not its number.
+      name: `${QUOTA_PREFIX}${bonus.activity_name ?? "活动奖励"}`,
       used: Math.min(100, Math.round(((points - remaining) / points) * 100)),
       resetsAt: expiresAt === null ? "" : new Date(expiresAt).toISOString(),
       display: `${round(remaining)} / ${round(points)}`,

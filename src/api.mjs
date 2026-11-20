@@ -28,6 +28,7 @@ import {
 } from "./constants.mjs"
 
 import { basicAuthorization, signHuaweiRequest, signV11Request } from "./crypto.mjs"
+import { QUOTA_PREFIX } from "./window-names.mjs"
 
 // ── 倍率 ──────────────────────────────────────────────────────────
 
@@ -187,7 +188,9 @@ export async function fetchUsage(cred) {
       if (!planName && typeof sku.sku_name === "string") planName = sku.sku_name
 
       windows.push({
-        name: `${sku.sku_name ?? "套餐"} · 剩 ${round(remaining)}`,
+        // T-31：名字里**不带**「· 剩 N」—— amount/limit 已经给了，magpie 自己会算剩余；
+        // 名字里再写一遍既重复，又会让窗口在每次刷新后「改名」。
+        name: `${QUOTA_PREFIX}${sku.sku_name ?? "套餐"}`,
         used: Math.min(100, Math.max(0, Math.round((used / total) * 100))),
         // 试用桶不带到期
         ...(isTrial ? {} : expiresAt !== null ? { resetsAt: new Date(expiresAt).toISOString() } : {}),
@@ -215,7 +218,8 @@ export async function fetchUsage(cred) {
     const expiresAt = typeof bonus.expired_time === "string" ? bonus.expired_time : null
 
     windows.push({
-      name: `${bonus.activity_name ?? "活动奖励"} · 剩 ${round(remaining)}`,
+      // T-31：同 O1，名字去掉「· 剩 N」
+      name: `${QUOTA_PREFIX}${bonus.activity_name ?? "活动奖励"}`,
       used: Math.min(100, Math.round(((points - remaining) / points) * 100)),
       ...(expiresAt !== null ? { resetsAt: new Date(expiresAt).toISOString() } : {}),
       display: `${round(remaining)} / ${round(points)}`,

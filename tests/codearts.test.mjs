@@ -613,10 +613,12 @@ test("usageFromStatistics maps credit metrics to windows with real numbers", () 
   assert.equal(usage.signIn, "kept")
   // The package total is listed first, then the buckets, all with display
   // numbers; only the total may pause the account, the buckets are aside.
+  // T-31: every window name carries one of the three prefixes; the name is the
+  // bucket, never its number (magpie renders the number itself).
   assert.deepEqual(usage.windows, [
-    { name: "总积分", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits" },
-    { name: "基础积分包", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits", aside: true },
-    { name: "按需积分包", used: 0, display: "0 / 2.0万", amount: 0, limit: 20000, unit: "credits", aside: true },
+    { name: "额度 · 总积分", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits" },
+    { name: "额度 · 基础积分包", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits", aside: true },
+    { name: "额度 · 按需积分包", used: 0, display: "0 / 2.0万", amount: 0, limit: 20000, unit: "credits", aside: true },
   ])
 })
 
@@ -625,7 +627,7 @@ test("usageFromStatistics adds the free daily pool as an aside window for the fr
     { metrics: [{ name: "usageTotalPackageCredit", package_credit_amount: 1000, package_credit_remain: 1000 }] },
     { result: { daily_token_limit: 10_000_000, daily_tokens_used: 2_500_000 } },
   )
-  const free = usage.windows.find((w) => w.name === "免费额度")
+  const free = usage.windows.find((w) => w.name === "额度 · 免费额度")
   assert.equal(free.used, 25)
   assert.equal(free.display, "250.0万 / 1000.0万")
   assert.equal(free.unit, "tokens")
@@ -665,11 +667,11 @@ test("usageFromStatistics: the soonest check-in credits to lapse show on the bon
       { name: "usageBonusPackageCredit", package_credit_amount: 2000, package_credit_remain: 1500 },
     ],
   }, undefined, { grants })
-  const bonus = usage.windows.find((w) => w.name === "赠送积分包")
+  const bonus = usage.windows.find((w) => w.name === "额度 · 赠送积分包")
   assert.equal(bonus.runsOutAt, grants[1].expiresAt)
   assert.equal(bonus.runsOut, 1000)
   // The total loses them too.
-  assert.equal(usage.windows.find((w) => w.name === "总积分").runsOutAt, grants[1].expiresAt)
+  assert.equal(usage.windows.find((w) => w.name === "额度 · 总积分").runsOutAt, grants[1].expiresAt)
   assert.equal(x.soonestLapse(x.grantBatches([grants[0]])), undefined)
 })
 
@@ -880,10 +882,12 @@ test("plugin exposes config, provider.models, and an oauth auth method", async (
   assert.equal(typeof plugin.config, "function")
   assert.equal(plugin.provider.id, "codearts")
   assert.equal(plugin.auth.provider, "codearts")
-  assert.equal(plugin.auth.methods.length, 2)
+  // ① 华为云 OAuth ② 一次验证码登录两个平台 ③ 从文件导入（粘贴）
+  assert.equal(plugin.auth.methods.length, 3)
   assert.equal(plugin.auth.methods[0].type, "oauth")
   assert.equal(plugin.auth.methods[1].type, "oauth")
   assert.equal(plugin.auth.methods[1].label, "一次验证码登录两个平台")
+  assert.match(plugin.auth.methods[2].label, /从文件导入/)
   assert.equal(typeof plugin.auth.checkin, "function")
   assert.equal(plugin.auth.maxConcurrency, x.ACCOUNT_MAX_INFLIGHT)
 
@@ -2525,7 +2529,7 @@ test("auth.usage reports the plan's credit window (the free pool is best-effort)
   const usage = await plugin.auth.usage(async () => makeAuth(cred))
   assert.equal(usage.plan, "企业版")
   assert.deepEqual(usage.windows, [
-    { name: "总积分", used: 60, display: "600 / 1000", amount: 600, limit: 1000, unit: "credits" },
+    { name: "额度 · 总积分", used: 60, display: "600 / 1000", amount: 600, limit: 1000, unit: "credits" },
   ])
   assert.deepEqual(asked, [x.SNAP_STATISTICS_URL, x.BENEFIT_BALANCE_URL, x.PACKAGE_CREDIT_PAGE_URL, x.PACKAGE_CREDIT_PAGE_URL, x.OPS_CREDIT_OVERVIEW_URL])
   // Read again within ten minutes: the batches aren't.
@@ -2620,7 +2624,7 @@ test("a claimed check-in is kept, and the usage card says when those credits run
   assert.equal(Date.parse(grant.expiresAt) - Date.parse(grant.at), 30 * 86_400_000)
 
   const usage = await plugin.auth.usage(async () => makeAuth(cred))
-  const bonus = usage.windows.find((w) => w.name === "赠送积分包")
+  const bonus = usage.windows.find((w) => w.name === "额度 · 赠送积分包")
   assert.equal(bonus.runsOutAt, grant.expiresAt)
   assert.equal(bonus.runsOut, 1000)
 })

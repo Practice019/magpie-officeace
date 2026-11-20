@@ -79,3 +79,39 @@ export function pickOfficeAceCredential(accounts) {
   if (!Array.isArray(accounts) || accounts.length === 0) return null
   return (accounts.find((a) => !a.cred?.modelAppKey) ?? accounts[0]).cred ?? null
 }
+
+/**
+ * 已保存账号的**键**与**刷新令牌**（只读，供「从文件导入（粘贴）」去重/分配新键）。
+ *
+ * 这里不走 `credentialOf()`：老记录可能只有 STS 三元组、或者形状不完整，
+ * 但它们在 magpie 里**确实已经是一个账号**，导入时同样不该重复写一份。
+ *
+ * @param {{file?: string, provider?: string}} [opts]
+ * @returns {{keys: Set<string>, refreshes: Set<string>}}
+ */
+export function officeAceAccountRefs(opts = {}) {
+  const provider = typeof opts.provider === "string" && opts.provider ? opts.provider : "officeace"
+  const keys = new Set()
+  const refreshes = new Set()
+  const file = officeAceAuthFile(opts)
+  let raw
+  try {
+    raw = fs.readFileSync(file, "utf8")
+  } catch {
+    return { keys, refreshes }
+  }
+  let all
+  try {
+    all = JSON.parse(raw)
+  } catch {
+    return { keys, refreshes }
+  }
+  if (!all || typeof all !== "object" || Array.isArray(all)) return { keys, refreshes }
+  for (const [key, auth] of Object.entries(all)) {
+    if (key !== provider && !key.startsWith(`${provider}#`)) continue
+    keys.add(key)
+    const refresh = auth && typeof auth === "object" ? auth.refresh : ""
+    if (typeof refresh === "string" && refresh) refreshes.add(refresh)
+  }
+  return { keys, refreshes }
+}

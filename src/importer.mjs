@@ -36,6 +36,14 @@ function parseLines(text) {
   return rows
 }
 
+/** 一条原始条目「自称」是哪个 provider（`provider` 或 `platform` 字段）。 */
+function declaredProviderOf(row) {
+  if (!isObject(row)) return undefined
+  if (Object.hasOwn(row, "provider")) return String(row.provider ?? "").trim()
+  if (Object.hasOwn(row, "platform")) return String(row.platform ?? "").trim()
+  return undefined
+}
+
 function accountsOf(text, provider) {
   const cleaned = String(text ?? "").replace(/^\uFEFF/, "")
   let data
@@ -58,7 +66,19 @@ function accountsOf(text, provider) {
     }
     return { accounts: data.accounts, tagged: true }
   }
-  return { accounts: Array.isArray(data) ? data : [data], tagged: false }
+  const accounts = Array.isArray(data) ? data : [data]
+
+  // ⚠ 一条**自称是别的 provider** 的行（`provider: "officeace"` / `platform: "codearts"`）
+  // 不能当成「没标 provider 的裸行」放过去：把 A 家的凭据写进 B 家的账号里，
+  // 用户看到的是「导入成功」，用起来却是 401。
+  //
+  // 整套粘贴只有一个 provider 标签（`tagged: false`）时，行上的 provider 是
+  // 用户手上那份导出自带的标记，必须与当前 provider 一致；只有当标记**不一致的
+  // 行不止一种**（把好几家的导出拼在一起），才退回老口径：让 toResult 自己判
+  // 字段结构（loomy 的 session-only 行也能导）。
+  const declared = new Set(accounts.map(declaredProviderOf).filter((p) => p !== undefined))
+  const mixed = declared.size > 1
+  return { accounts, tagged: mixed ? false : declared.size === 1 && declared.has(provider) }
 }
 
 export function importFields(row, required, optional, keyField) {
@@ -111,63 +131,77 @@ export function validateImportMaas(key, secret, base) {
 export function makeImportHook({ provider, label, clientId, allowedClients = [clientId], accessField, sessionOf, toResult, normalizeRow }) {
   return {
     importFrom: `${label} 账号 UTF-8 JSON（单对象、数组、version: 1 容器，或每行一个对象的 NDJSON；最多处理前 100 条）`,
-    async import(texts, { signal } = {}) {
-      if (signal?.aborted) return []
-      if (!Array.isArray(texts) || texts.length === 0) return [{ type: "failed", error: "没有可导入的 JSON 文件" }]
-      const results = []
-      const uids = new Set()
-      const tokens = new Set()
-      const keys = new Set()
-      const sessions = new Set()
-      const fail = (location, err) => results.push({
-        type: "failed",
-        error: `${location}：${err instanceof ImportError ? err.message : "凭据校验失败"}`,
-      })
-      for (const [file, text] of texts.entries()) {
+    import: makeCollector({ provider, clientId, allowedClients, accessField, sessionOf, toResult, normalizeRow }),
+  }
+}
+
+/**
+ * 同一个解析器，换个入口：登录弹窗的「从文件导入（粘贴）」要自己拿结果
+ * （宿主一次登录只能保存一个账号，其余的要插件用 `client.auth.set` 写）。
+ *
+ * ⚠ 与 `auth.import` 是**同一段代码**：不许为粘贴再写一套解析器。
+ *
+ * @param {{provider: string, clientId: string, allowedClients?: string[],
+ *   accessField: string, sessionOf?: Function, toResult: Function, normalizeRow?: Function}} cfg
+ * @returns {(texts: string[], ctx?: {signal?: AbortSignal}) => Promise<object[]>}
+ */
+export function makeCollector({ provider, clientId, allowedClients = [clientId], accessField, sessionOf, toResult, normalizeRow }) {
+  return async function collect(texts, { signal } = {}) {
+    if (signal?.aborted) return []
+    if (!Array.isArray(texts) || texts.length === 0) return [{ type: "failed", error: "没有可导入的 JSON 文件" }]
+    const results = []
+    const uids = new Set()
+    const tokens = new Set()
+    const keys = new Set()
+    const sessions = new Set()
+    const fail = (location, err) => results.push({
+      type: "failed",
+      error: `${location}：${err instanceof ImportError ? err.message : "凭据校验失败"}`,
+    })
+    for (const [file, text] of texts.entries()) {
+      if (signal?.aborted || results.length >= IMPORT_MOST) break
+      const location = `文件 ${file + 1}`
+      let parsed
+      try {
+        parsed = accountsOf(text, provider)
+        if (!parsed.accounts.length) throw new ImportError("没有账号条目")
+      } catch (err) {
+        fail(location, err)
+        continue
+      }
+      for (const [index, row] of parsed.accounts.entries()) {
         if (signal?.aborted || results.length >= IMPORT_MOST) break
-        const location = `文件 ${file + 1}`
-        let parsed
         try {
-          parsed = accountsOf(text, provider)
-          if (!parsed.accounts.length) throw new ImportError("没有账号条目")
-        } catch (err) {
-          fail(location, err)
-          continue
-        }
-        for (const [index, row] of parsed.accounts.entries()) {
-          if (signal?.aborted || results.length >= IMPORT_MOST) break
-          try {
-            if (!isObject(row)) throw new ImportError("账号必须是结构化 JSON 对象")
-            const declared = row.provider ?? row.platform
-            if ((!parsed.tagged || Object.hasOwn(row, "provider") || Object.hasOwn(row, "platform")) && declared !== provider) {
-              throw new ImportError("账号的 provider 缺失或与当前供应商不匹配")
-            }
-            const normalized = normalizeRow ? await normalizeRow(row) : row
-            if (!isObject(normalized)) throw new ImportError("账号必须是结构化 JSON 对象")
-            const { provider: _provider, platform: _platform, ...cred } = normalized
-            if (Object.hasOwn(cred, "oauth_client") && !allowedClients.includes(cred.oauth_client)) {
-              throw new ImportError("OAuth client 与当前供应商不匹配")
-            }
-            const result = await toResult(cred)
-            if (signal?.aborted) break
-            if (!isText(result.uid)) throw new ImportError("缺少可用的稳定账号身份")
-            if (uids.has(result.uid) || tokens.has(result.refresh) || keys.has(cred[accessField])) {
-              throw new ImportError("本批次已导入同一账号或 STS 凭据")
-            }
-            const session = sessionOf?.(cred, result)
-            if (session && sessions.has(session)) throw new ImportError("本批次已使用同一会话标识")
-            uids.add(result.uid)
-            tokens.add(result.refresh)
-            keys.add(cred[accessField])
-            if (session) sessions.add(session)
-            results.push(result)
-          } catch (err) {
-            if (signal?.aborted) break
-            fail(`${location} 第 ${index + 1} 条`, err)
+          if (!isObject(row)) throw new ImportError("账号必须是结构化 JSON 对象")
+          const declared = row.provider ?? row.platform
+          if ((!parsed.tagged || Object.hasOwn(row, "provider") || Object.hasOwn(row, "platform")) && declared !== provider) {
+            throw new ImportError("账号的 provider 缺失或与当前供应商不匹配")
           }
+          const normalized = normalizeRow ? await normalizeRow(row) : row
+          if (!isObject(normalized)) throw new ImportError("账号必须是结构化 JSON 对象")
+          const { provider: _provider, platform: _platform, ...cred } = normalized
+          if (Object.hasOwn(cred, "oauth_client") && !allowedClients.includes(cred.oauth_client)) {
+            throw new ImportError("OAuth client 与当前供应商不匹配")
+          }
+          const result = await toResult(cred)
+          if (signal?.aborted) break
+          if (!isText(result.uid)) throw new ImportError("缺少可用的稳定账号身份")
+          if (uids.has(result.uid) || tokens.has(result.refresh) || keys.has(cred[accessField])) {
+            throw new ImportError("本批次已导入同一账号或 STS 凭据")
+          }
+          const session = sessionOf?.(cred, result)
+          if (session && sessions.has(session)) throw new ImportError("本批次已使用同一会话标识")
+          uids.add(result.uid)
+          tokens.add(result.refresh)
+          keys.add(cred[accessField])
+          if (session) sessions.add(session)
+          results.push(result)
+        } catch (err) {
+          if (signal?.aborted) break
+          fail(`${location} 第 ${index + 1} 条`, err)
         }
       }
-      return results
-    },
+    }
+    return results
   }
 }

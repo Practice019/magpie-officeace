@@ -189,15 +189,17 @@ test("说明文案：控制台那条如实写「要登录就用同一账号」�
   assert.ok(_internal.MAAS_ALREADY_INSTRUCTIONS.includes("已经开通"))
 })
 
-test("主入口复用凭据，第二入口用于添加其他账号，第三入口一次验证码登录两个平台", async () => {
+test("主入口复用凭据，第二入口用于添加其他账号，第三入口一次验证码登录两个平台，第四入口从文件导入", async () => {
   const plugin = await OfficeAceAuthPlugin({}, { authFile: tempAuthFile(), fetch: noModelInfo })
-  assert.equal(plugin.auth.methods.length, 3)
+  assert.equal(plugin.auth.methods.length, 4)
   assert.equal(plugin.auth.methods[0].type, "oauth")
   assert.equal(plugin.auth.methods[0].label, "华为云账号")
   assert.equal(plugin.auth.methods[1].type, "oauth")
   assert.equal(plugin.auth.methods[1].label, "添加其他华为云账号")
   assert.equal(plugin.auth.methods[2].type, "oauth")
   assert.equal(plugin.auth.methods[2].label, "一次验证码登录两个平台")
+  assert.equal(plugin.auth.methods[3].type, "oauth")
+  assert.match(plugin.auth.methods[3].label, /从文件导入/)
 })
 
 test("单入口 · 凭据已能开通：直接完成，不轮询", async () => {
