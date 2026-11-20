@@ -3180,3 +3180,73 @@ const oaMaasAnswer = (key = "app-key", secret = "app-secret") =>
 
 // ---- the migration path: an officeace-auth record keeps working ------------
 
+// ---- model capabilities come from the upstream (T-27) ----------------------
+//
+// The user's words: 「每个模型它能支持什么，全部从上游获取就行了。」 Neither
+// gateway/config nor the builtin list declares a capability field today, so
+// every model is text-only — that is what the upstream says, not a constant.
+// These pin the mapping the moment one of them does declare something.
+
+test("a gateway item that declares capabilities carries them; one that declares none carries none", () => {
+  const declared = x.parseModelInfo(
+    {
+      model_id: "GLM-5.2",
+      model_name: "GLM-5.2",
+      context_window: 200000,
+      capabilities: { vision: true, input_modalities: ["text", "image"] },
+    },
+    new Set(),
+  )
+  assert.equal(declared.upstream.capabilities.vision, true, "能力声明不许在解析时被丢掉")
+
+  const silent = x.parseModelInfo({ model_id: "deepseek-v4.1-flash", model_name: "DeepSeek-V4.1-Flash" }, new Set())
+  assert.equal(silent.upstream, undefined, "上游没说 ≠ 上游说了纯文本")
+})
+
+test("upstreamCapabilities: vision and modalities always agree", () => {
+  const sees = x.upstreamCapabilities({ capabilities: { vision: true, input_modalities: ["text", "image"] } })
+  assert.equal(sees.vision, true)
+  assert.deepEqual(sees.inputModalities, ["text", "image"])
+  assert.equal(sees.input.image, true)
+
+  // vision true without a modality list: image is added, never left contradictory
+  const half = x.upstreamCapabilities({ capabilities: { vision: true } })
+  assert.deepEqual(half.inputModalities, ["text", "image"])
+
+  const plain = x.upstreamCapabilities(undefined)
+  assert.equal(plain.vision, false)
+  assert.deepEqual(plain.inputModalities, ["text"])
+  assert.deepEqual(plain.input, { text: true, image: false, audio: false, video: false, pdf: false })
+  assert.equal(plain.toolcall, true)
+
+  const noTools = x.upstreamCapabilities({ capabilities: { function_calling: false } })
+  assert.equal(noTools.toolcall, false)
+})
+
+test("a multimodal content array goes out unchanged (image parts are never trimmed)", () => {
+  const parts = [
+    { type: "text", text: "这张图里是什么" },
+    { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" } },
+  ]
+  const prepared = x.prepareChatBody({
+    model: "deepseek-v4.1-flash",
+    messages: [{ role: "user", content: parts }],
+  })
+
+  assert.ok(prepared, "a chat body stays a chat body")
+  assert.deepEqual(prepared.body.messages[0].content, parts, "image_url 段必须逐字段还在")
+})
+
+test("joining two same-role turns concatenates their parts instead of dropping them", () => {
+  const image = { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } }
+  const merged = x.mergeConsecutiveTurns({
+    messages: [
+      { role: "user", content: [{ type: "text", text: "a" }] },
+      { role: "user", content: [image] },
+    ],
+  })
+  assert.equal(merged.length, 1)
+  assert.deepEqual(merged[0].content, [{ type: "text", text: "a" }, image])
+})
+
+

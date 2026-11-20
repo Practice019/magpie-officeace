@@ -50,6 +50,9 @@ import path from "node:path"
 
 // 出站 UA 的唯一来源（officeace 与 codearts 共用一条），见 ../constants.mjs 的注释。
 import { UA } from "../constants.mjs"
+// 模型能力**只在一处映射**（与 OfficeAce 那条 provider 共用同一个函数）：
+// 上游给了什么能力就说什么，没给就是纯文本。
+import { upstreamCapabilities, pickUpstreamCapabilities } from "../models.mjs"
 import { ImportError, importFields, makeImportHook, validateImportDpop, validateImportExpiry, validateImportMaas, validateImportVerifier } from "../importer.mjs"
 import { beginLogin as beginOfficeAceLogin } from "../login.mjs"
 import { launchIsolatedLogin } from "../isolated-login.mjs"
@@ -271,13 +274,17 @@ const CATALOG = [
   { id: "deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash" },
 ]
 
-// Every model listed takes text alone: the vision ones (`-vl`) are left out
-// (parseModelInfo), and the rest answer an image with
+// Every model these two lists yield takes text alone today: the vision ones
+// (`-vl`) are left out (parseModelInfo), and the rest answer an image with
 // `InferHub.001001020.406` "The request model is not multimodal". Said in so
 // many words (`image: false`, not left out, which magpie reads as unknown),
 // so magpie describes an image for the model or leaves it out, and an agent
 // is told it takes none.
-const TEXT_ONLY = { input: { text: true, image: false, audio: false, video: false, pdf: false } }
+//
+// ⚠ That is what the **upstream says** (nothing), not a constant: neither
+// gateway/config nor the builtin list carries a capability field. The moment
+// one of them does, `upstreamCapabilities` (src/models.mjs) takes over and a
+// model that sees is listed as seeing.
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -2830,6 +2837,11 @@ function parseModelInfo(m, seen) {
   const info = { id, name, context: num(m.context_window) || CONTEXT_WINDOWS[base] }
   const output = num(m.max_tokens)
   if (output > 0) info.output = Math.min(output, MAX_OUTPUT_TOKENS)
+  // 能力声明：gateway/config 与 builtin 两条目录**目前一个能力字段都不给**
+  // （只有 model_id / model_name / context_window / max_tokens）。给了就原样带走，
+  // 映射只在 `modelOf` 一处发生 —— 这里不解释，见 README「模型能力从哪来」。
+  const declared = pickUpstreamCapabilities(m)
+  if (declared) info.upstream = declared
   return info
 }
 
@@ -3304,19 +3316,27 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
     // Declared so a caller never sends its own, larger default.
     limit: { context: m.context ?? 0, output: MAX_OUTPUT_TOKENS },
     tool_call: true,
-    // Text only (TEXT_ONLY): said, not left out, so an agent sends no image.
+    // Text only: said, not left out, so an agent sends no image. (The CATALOG is
+    // the pre-sign-in table; the upstream declares no capability either way.)
     attachment: false,
     modalities: { input: ["text"], output: ["text"] },
   })
 
   const modelOf = (provider, live, state) => {
     const base = provider.models?.[live.id] ?? {}
+    // What the upstream said of this model's capabilities — gateway/config and
+    // the builtin list declare none today, so this is text only unless one day
+    // they start. Nothing here is guessed from the model's name.
+    const up = upstreamCapabilities(live.upstream)
+    // The user's own config may say the model sees; two declarations of one fact
+    // must not disagree, so `attachment` (top level) follows either of them.
+    const sees = up.vision || base.capabilities?.input?.image === true
     const capabilities = {
-      temperature: true, toolcall: true, output: { text: true }, attachment: false,
+      temperature: true, toolcall: up.toolcall, output: up.output, attachment: sees,
       ...(base.capabilities ?? {}),
       ...(live.reasoning ? { reasoning: true } : {}),
       // what the user's own config says of a kind stands; the rest is text only
-      input: { ...TEXT_ONLY.input, ...(base.capabilities?.input ?? {}) },
+      input: { ...up.input, ...(base.capabilities?.input ?? {}) },
     }
     // magpie's own fields: `free` (from the free daily pool, the same answer
     // the signed `maas_type: benefit` header follows, so a model never shows
@@ -3329,6 +3349,9 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
       name: live.name || base.name || live.id,
       limit: { context: live.context ?? base.limit?.context ?? 0, output: live.output ?? MAX_OUTPUT_TOKENS },
       capabilities,
+      modalities: { input: up.inputModalities, output: up.outputModalities },
+      attachment: sees,
+      supportsImage: sees,
       free,
       ...(!free && live.rate > 0 ? { rate: live.rate } : {}),
     }
@@ -3865,6 +3888,7 @@ export const _internal = {
   isRegularModel, queueInfoOf, waitInQueue, TRACE_QUEUE_URL, SESSION_HEADER,
   snapRequest, dailyCheckin,
   parseModelInfo, extractArray, fetchRemoteModels, dedupeAliases, shortAccountName, creditWindow, benefitWindow, usageFromStatistics,
+  upstreamCapabilities, pickUpstreamCapabilities,
   finalizeCodeArtsSignIn, finalizeOfficeAceSignIn, noteProviderAccount, recordKeyFor,
 }
 
