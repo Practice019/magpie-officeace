@@ -693,21 +693,24 @@ export const OfficeAceAuthPlugin = async ({ client, magpie, directory } = {}, op
         isolatedWindow = null
         isolatedError = String(e?.message ?? e).slice(0, 500)
       }
-      if (isolatedError) {
-        // 没窗口可登录：取消后台轮询，并接住迟到拒绝，避免未处理 Promise。
-        try { started.close?.() } catch {}
-        void started.result?.catch?.(() => {})
-      }
+      // Linux 等无浏览器环境：不取消后台轮询 —— 授权码由云端按 state 下发，
+      // 用户在自己的浏览器登录即可，服务器照样能拿到 code。
+    }
+    const manual = Boolean(isolated && isolatedError)
+    if (manual) {
+      const msg = `无法在服务器上打开登录窗口（${isolatedError}）。请在自己的浏览器打开下面的链接完成华为云登录；服务器会自动轮询授权结果，无需在本机回调。`
+      log?.(msg, "warn")
     }
     return {
       url: started.url,
-      ...(isolated ? { opened: true } : {}),
-      instructions: isolated
-        ? "已打开独立登录窗口（不带你日常浏览器的 Cookie 或旧账号会话）。请在里面完成华为云登录，完成后窗口会自动关闭。"
-        : MAAS_OAUTH_INSTRUCTIONS,
+      ...(isolated && !manual ? { opened: true } : {}),
+      instructions: manual
+        ? "请在你的浏览器打开此链接并登录华为云；登录完成后回来等待，服务器会自动拿到授权结果。"
+        : isolated
+          ? "已打开独立登录窗口（不带你日常浏览器的 Cookie 或旧账号会话）。请在里面完成华为云登录，完成后窗口会自动关闭。"
+          : MAAS_OAUTH_INSTRUCTIONS,
       method: "auto",
       async callback() {
-        if (isolatedError) return { type: "failed", error: isolatedError }
         try {
           const cred = await started.result
           const identified = { ...cred, ...(await phoneField(cred)) }

@@ -66,22 +66,24 @@ test("添加其他华为云账号：已有健康凭据也直接起新 OAuth，�
   assert.equal(clientProbes, 0)
 })
 
-test("隔离窗口启动失败：callback 如实失败，不退回日常浏览器，并取消轮询", async () => {
+test("隔离窗口启动失败：降级为手动 URL，继续轮询且不取消登录", async () => {
   let loginClosed = 0
   const plugin = await OfficeAceAuthPlugin({}, {
     authFile: path.join(os.tmpdir(), "officeace-no-such-auth-file.json"),
     beginLogin: async () => ({
       url: "https://auth.huaweicloud.com/authui/login.html",
-      result: new Promise(() => {}),
+      result: Promise.reject(new Error("登录已取消")),
       close: () => { loginClosed++ },
     }),
     isolatedLogin: async () => ({ ok: false, error: "未找到 Chromium", close: async () => {} }),
   })
   const a = await plugin.auth.methods[1].authorize()
   assert.equal(a.url, "https://auth.huaweicloud.com/authui/login.html")
-  assert.equal(a.opened, true)
-  assert.deepEqual(await a.callback(), { type: "failed", error: "未找到 Chromium" })
-  assert.equal(loginClosed, 1)
+  assert.equal(a.opened, undefined, "失败时不声明 opened，宿主才不会尝试自己开浏览器")
+  assert.match(a.instructions, /你的浏览器/)
+  // callback 仍在等 beginLogin 的轮询结果，而不是因为开不了窗口就提前失败
+  assert.deepEqual(await a.callback(), { type: "failed", error: "登录已取消" })
+  assert.equal(loginClosed, 0)
 })
 
 test("OAuth 结束后关闭本次隔离窗口", async () => {
