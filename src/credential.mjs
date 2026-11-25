@@ -183,6 +183,26 @@ export function stsExpired(cred, nowMs = Date.now(), leadMs = 0) {
   return Number.isFinite(at) ? at <= nowMs + leadMs : false
 }
 
+/** 华为云 STS 的标准有效期（没有签发时间时用它算 50%）。 */
+export const STS_TTL_MS = 60 * 60 * 1000
+
+/**
+ * STS 是否走完了总有效期的一半（即剩余不足一半）——到期时间到达 50% 就该续。
+ *
+ * 有 `stsIssuedAt` 时按真实签发时间算严格 50%；老凭据没有签发时间，
+ * 按华为云 STS 的标准 1 小时算，也就是剩余 <= 30 分钟时续。
+ */
+export function stsNeedsRefresh(cred, nowMs = Date.now()) {
+  const raw = cred?.expiresAt ?? cred?.expires_at
+  if (!raw) return false
+  const exp = typeof raw === "number" ? raw : Date.parse(raw)
+  if (!Number.isFinite(exp)) return false
+  const issuedRaw = cred?.stsIssuedAt ?? cred?.sts_issued_at
+  const issued = typeof issuedRaw === "number" ? issuedRaw : Date.parse(issuedRaw ?? "")
+  const total = Number.isFinite(issued) && issued > 0 && exp > issued ? exp - issued : STS_TTL_MS
+  return nowMs >= exp - total / 2
+}
+
 /**
  * 基本认证的指纹（key + secret + 宿主）。
  *

@@ -301,6 +301,8 @@ async function doRefresh(current, persist) {
     securityToken: c.security_token,
     projectId: c.project_id ?? current.projectId,
     expiresAt: c.expiration,
+    stsIssuedAt: Date.now(),
+    sessionIssuedAt: current.sessionIssuedAt ?? Date.now(),
     refreshToken: token.refresh_token ?? current.refreshToken,
   }
 

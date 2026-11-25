@@ -1125,8 +1125,12 @@ export const OfficeAceAuthPlugin = async ({ client, magpie, directory } = {}, op
         // T-41：**走完总有效期的 50% 才续**。会话 JWT 自带 iat/exp，算得出「一半」；
         // 没过半就直接返回原凭据 —— 一个上游请求都不发（magpie 的 refreshLead 只是
         // 让它「临期来问」，真正的闸门在这里）。解不出 JWT 才照旧续（兜底）。
+        // 有 JWT 用它的 iat/exp；新凭据额外记了 sessionIssuedAt，老凭据则沿用
+        // 原行为。判据统一为「走完总有效期 50%」，不是临期才续。
         const claims = readJwtClaims(cred.refreshToken)
-        if (claims && !pastHalfLife(claims.iat, claims.exp)) return undefined
+        const iatSec = claims?.iat ?? (cred.sessionIssuedAt ? Math.floor(cred.sessionIssuedAt / 1000) : 0)
+        const expSec = claims?.exp ?? 0
+        if (iatSec && expSec > iatSec && !pastHalfLife(iatSec, expSec)) return undefined
 
 
         try {

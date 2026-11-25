@@ -10,10 +10,8 @@
 import fs from "node:fs"
 import path from "node:path"
 import { refreshOnce } from "./login.mjs"
-import { expiryMs, stsExpired } from "./credential.mjs"
+import { expiryMs, stsNeedsRefresh } from "./credential.mjs"
 import { officeAceAuthFile } from "./accounts.mjs"
-
-const STS_LEAD_MS = 60 * 1000
 
 function parseMaybeJson(text) {
   try {
@@ -74,7 +72,7 @@ export function makeStsFresh({
   const target = String(authFile ?? officeAceAuthFile())
 
   return async function ensureFreshSts(cred) {
-    if (!cred?.refreshToken || !stsExpired(cred, now(), STS_LEAD_MS)) return cred
+    if (!cred?.refreshToken || !stsNeedsRefresh(cred, now())) return cred
     if (guard?.isDead?.(cred)) return cred
     const oldRefresh = cred.refreshToken
     try {

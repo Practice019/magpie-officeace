@@ -3818,8 +3818,12 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
         // ⚠ 这里**不是**「STS 没过期就不续」：STS 只有 ~1 小时，用它当闸门会让会话
         //   永远卡在「STS 过期但会话还有 27 天」的错位里 —— 判据只看会话 JWT。
         // 解不出 JWT 时照旧续（老凭据兜底）。
+        // 统一为「走完总有效期 50%」：先取会话 JWT 的 iat/exp；新凭据
+        // 额外记了 sessionIssuedAt，老凭据解不出 JWT 时沿用原兜底。
         const claims = readJwtClaims(cred.refresh_token)
-        if (claims && !pastHalfLife(claims.iat, claims.exp)) return undefined
+        const iatSec = claims?.iat ?? (cred.sessionIssuedAt ? Math.floor(cred.sessionIssuedAt / 1000) : 0)
+        const expSec = claims?.exp ?? 0
+        if (iatSec && expSec > iatSec && !pastHalfLife(iatSec, expSec)) return undefined
         const renewed = await renewOnce(cred)
         // A rotation rebuilds the credential: keep the phone, which only the
         // stored one knows (`renewOnce` carries `session_id` itself), and read

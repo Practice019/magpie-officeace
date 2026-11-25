@@ -4,7 +4,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
-import { stsExpired } from "../src/credential.mjs"
+import { stsExpired, stsNeedsRefresh } from "../src/credential.mjs"
 import { makeStsFresh, persistRefreshedAuth } from "../src/sts-refresh.mjs"
 
 const day = 24 * 60 * 60 * 1000
@@ -16,6 +16,19 @@ test("stsExpired reads both field spellings and treats past ISO strings as expir
   assert.equal(stsExpired({ expires_at: past }), true)
   assert.equal(stsExpired({ expiresAt: future }), false)
   assert.equal(stsExpired({}), false)
+})
+
+test("stsNeedsRefresh fires at 50% of lifetime, not only at expiry", () => {
+  const now = Date.now()
+  const halfHour = 30 * 60 * 1000
+  // 无签发时间：按 STS 标准 1 小时算，剩余 20 分钟（< 30 分钟）就续
+  assert.equal(stsNeedsRefresh({ expiresAt: new Date(now + 20 * 60_000).toISOString() }, now), true)
+  assert.equal(stsNeedsRefresh({ expiresAt: new Date(now + 40 * 60_000).toISOString() }, now), false)
+  // 有签发时间：严格按真实总长的一半
+  const issued = now - 2 * halfHour
+  const exp = now + 2 * halfHour
+  assert.equal(stsNeedsRefresh({ expiresAt: new Date(exp).toISOString(), stsIssuedAt: issued }, now), true)
+  assert.equal(stsNeedsRefresh({ expiresAt: new Date(now + 3 * halfHour).toISOString(), stsIssuedAt: issued }, now), false)
 })
 
 test("persistRefreshedAuth updates only the matching Huawei account", (t) => {
