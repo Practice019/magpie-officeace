@@ -13,11 +13,16 @@ import crypto from "node:crypto"
 
 export const DEAD_REFRESH_TTL_MS = 24 * 60 * 60 * 1000
 
+/** magpie 的 officeace 用 camelCase，codearts 凭据用 snake_case。 */
+export function refreshTokenOf(cred) {
+  return String(cred?.refreshToken ?? cred?.refresh_token ?? "")
+}
+
 /** 只保留哈希前缀：文件泄露也不会暴露任何可用凭据。 */
 export function deadRefreshKey(cred) {
   return crypto
     .createHash("sha256")
-    .update(String(cred?.refreshToken ?? ""))
+    .update(refreshTokenOf(cred))
     .digest("hex")
     .slice(0, 16)
 }
@@ -51,14 +56,14 @@ export function makeDeadRefreshGuard({ file = "", now = () => Date.now(), ttlMs 
   return {
     /** 这个 refresh_token 是否处于冷却期。 */
     isDead(cred) {
-      if (!cred?.refreshToken || !target) return false
+      if (!refreshTokenOf(cred) || !target) return false
       const ts = Number(read()[deadRefreshKey(cred)] ?? 0)
       return Number.isFinite(ts) && ts > 0 && now() - ts < ttlMs
     },
 
     /** 标记它已死（STS5.1806 等明确永久失败才调），到期的键顺手清掉。 */
     markDead(cred) {
-      if (!cred?.refreshToken || !target) return false
+      if (!refreshTokenOf(cred) || !target) return false
       const stamp = now()
       const data = read()
       for (const [k, v] of Object.entries(data)) {

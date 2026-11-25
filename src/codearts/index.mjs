@@ -3493,7 +3493,6 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
   const deadRefresh = makeDeadRefreshGuard({
     file: path.join(path.dirname(codeArtsAuthFile), "officeace-dead-refresh.json"),
   })
-  const stsFresh = makeStsFresh({ authFile: codeArtsAuthFile, guard: deadRefresh })
   const ledgerPath = typeof options?.ledgerPath === "string" && options.ledgerPath ? options.ledgerPath : defaultLedgerPath()
   // Test hooks: the clock and the sleep the retry budget runs on.
   const now = typeof options?.now === "function" ? options.now : Date.now
@@ -3581,6 +3580,17 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
     }
     return state.renewing.promise
   }
+  // 读额度前的 STS 前置续期：codearts 用自己的 refreshCredential（snake_case），
+  // 不能走 officeace 的 refreshOnce；这里注入 renewOnce 并复用同一套落盘逻辑。
+  const stsFresh = makeStsFresh({
+    authFile: codeArtsAuthFile,
+    guard: deadRefresh,
+    refresh: async (cred, persist) => {
+      const next = await renewOnce(cred)
+      persist?.(next)
+      return next
+    },
+  })
   // The ledger's key: the signer, which outlives a sign-in; else the session.
   const ledgerKey = (cred) => ledgerKeyOf(cred)
 

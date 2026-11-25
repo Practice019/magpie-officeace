@@ -12,6 +12,7 @@ import path from "node:path"
 import { refreshOnce } from "./login.mjs"
 import { expiryMs, stsNeedsRefresh } from "./credential.mjs"
 import { officeAceAuthFile } from "./accounts.mjs"
+import { refreshTokenOf } from "./refresh-guard.mjs"
 
 function parseMaybeJson(text) {
   try {
@@ -37,14 +38,17 @@ export function persistRefreshedAuth({ authFile, oldRefresh, next }) {
   const key = Object.keys(all).find(
     (k) =>
       (k.startsWith("officeace") || k.startsWith("codearts")) &&
-      (all[k]?.refresh === oldRefresh || parseMaybeJson(all[k]?.access)?.refreshToken === oldRefresh),
+      (all[k]?.refresh === oldRefresh ||
+        parseMaybeJson(all[k]?.access)?.refreshToken === oldRefresh ||
+        parseMaybeJson(all[k]?.access)?.refresh_token === oldRefresh),
   )
   if (!key) return false
 
   const entry = all[key]
   const merged = { ...(parseMaybeJson(entry.access) ?? {}), ...next }
   entry.access = JSON.stringify(merged)
-  if (next.refreshToken) entry.refresh = next.refreshToken
+  const newRefresh = next.refreshToken ?? next.refresh_token
+  if (newRefresh) entry.refresh = newRefresh
   entry.expires = expiryMs(next)
 
   try {
@@ -72,9 +76,9 @@ export function makeStsFresh({
   const target = String(authFile ?? officeAceAuthFile())
 
   return async function ensureFreshSts(cred) {
-    if (!cred?.refreshToken || !stsNeedsRefresh(cred, now())) return cred
+    const oldRefresh = refreshTokenOf(cred)
+    if (!oldRefresh || !stsNeedsRefresh(cred, now())) return cred
     if (guard?.isDead?.(cred)) return cred
-    const oldRefresh = cred.refreshToken
     try {
       const next = await refresh(cred, (n) => persistRefreshedAuth({ authFile: target, oldRefresh, next: n }))
       return next ?? cred
