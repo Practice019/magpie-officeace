@@ -40,8 +40,10 @@
 //
 // ═══════════════════════════════════════════════════════════════════════
 
+import path from "node:path"
 import { CLIENT_ID, EXPIRY_LEAD_MS } from "./src/constants.mjs"
 import { credentialOf, toStored, expiryMs } from "./src/credential.mjs"
+import { makeDeadRefreshGuard } from "./src/refresh-guard.mjs"
 import { accountIdentityOf, phoneField, profileOf } from "./src/phone.mjs"
 import { ImportError, importFields, makeCollector, makeImportHook, validateImportDpop, validateImportExpiry, validateImportMaas, validateImportVerifier } from "./src/importer.mjs"
 import { makePasteImportMethod } from "./src/paste-import.mjs"
@@ -531,6 +533,10 @@ export const OfficeAceAuthPlugin = async ({ client, magpie, directory } = {}, op
     typeof options?.waitConsoleLogin === "function" ? options.waitConsoleLogin : waitForLoginAndSave
   // magpie 保存账号的那个文件（只读；见 src/accounts.mjs）。测试可注入。
   const authFile = officeAceAuthFile({ file: options?.authFile })
+  // 一次性 refresh_token 被消费后，24 小时内不再重试（只存哈希，不存 token）
+  const deadRefresh = makeDeadRefreshGuard({
+    file: path.join(path.dirname(authFile), "officeace-dead-refresh.json"),
+  })
   // 测试注入：真实的 beginLogin 会去 CLAW 注册 state 并后台轮询 10 分钟
   // 登录入口统一走 src/login-method.mjs：现在只有浏览器实现；下一期把
   // options.builtinLogin（账号/密码/验证码）传进来即可，浏览器自动降为回退。
@@ -782,8 +788,10 @@ export const OfficeAceAuthPlugin = async ({ client, magpie, directory } = {}, op
               if (match) {
                 const entry = match
                 let ready = entry.cred
-                if (needsRefresh(ready) && ready.refreshToken) {
-                  try { ready = (await refreshOnce(ready)) ?? ready } catch {}
+                if (needsRefresh(ready) && ready.refreshToken && !deadRefresh.isDead(ready)) {
+                  try { ready = (await refreshOnce(ready)) ?? ready } catch (e) {
+                    if (e?.deadRefresh) deadRefresh.markDead(ready)
+                  }
                 }
                 // 快速看一眼订阅：① 顺手更新额度缓存（T-39：用户点了「重新登录」= 显式读一次）
                 //                    ② 缺 trial 且开关打开时后台补领（不阻塞 authorize）
@@ -818,10 +826,11 @@ export const OfficeAceAuthPlugin = async ({ client, magpie, directory } = {}, op
 
             // 凭据过期/临期：先用它的 refresh_token 续一次（不续的话探测必然 401，
             // 用户又得重新登录一次）
-            if (pending && needsRefresh(pending) && pending.refreshToken) {
+            if (pending && needsRefresh(pending) && pending.refreshToken && !deadRefresh.isDead(pending)) {
               try {
                 pending = (await refreshOnce(pending)) ?? pending
-              } catch {
+              } catch (e) {
+                if (e?.deadRefresh) deadRefresh.markDead(pending)
                 /* 续不动就用旧的去探，探不动自然会走登录 */
               }
             }
@@ -1107,6 +1116,8 @@ export const OfficeAceAuthPlugin = async ({ client, magpie, directory } = {}, op
       async refresh(auth, provider) {
         const cred = credentialOf(auth)
         if (!cred?.refreshToken) return undefined
+        // 已确认被消费的一次性 token：冷却期内直接跳过，不再打 STS 刷错误日志
+        if (deadRefresh.isDead(cred)) return undefined
 
         // T-41：**走完总有效期的 50% 才续**。会话 JWT 自带 iat/exp，算得出「一半」；
         // 没过半就直接返回原凭据 —— 一个上游请求都不发（magpie 的 refreshLead 只是
@@ -1133,7 +1144,9 @@ export const OfficeAceAuthPlugin = async ({ client, magpie, directory } = {}, op
             ...accountIdentityOf(identified),
           }
         } catch (e) {
-          // 一次性 refresh_token 被消费 → 标记账号，不再重试直到重新登录
+          // 一次性 refresh_token 被消费 → 落盘冷却，后续请求不再重试；
+          // 临时故障（HTTP 500/网络）不标记，下次仍可正常续。
+          if (e?.deadRefresh) deadRefresh.markDead(cred)
           throw Object.assign(new Error("OfficeAce 续期失败，请重新登录"), {
             signIn: "expired",
           })

@@ -281,8 +281,12 @@ async function doRefresh(current, persist) {
       `[officeace] STS 续期失败 HTTP ${r.status}：${detail.slice(0, 200)}` +
         "（refresh_token 是一次性的：若报 STS5.1806 已被消费，必须重新登录）",
     )
+    // 区分「一次性 token 已被消费」（永久）与 HTTP 500/网络抖动等临时失败：
+    // 只有前者才让调用方给这个 refresh_token 加本地冷却。
+    const deadRefresh = /STS5\.1806|ExpiredRefreshToken|invalid refresh token|refresh token has been used/i.test(detail)
     throw Object.assign(new Error("OfficeAce 续期失败，请重新登录"), {
       signIn: "expired",
+      deadRefresh,
     })
   }
 
