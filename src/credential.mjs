@@ -170,6 +170,20 @@ export function nearExpiry(cred, leadMs) {
 }
 
 /**
+ * STS 临时凭据（AK/SK/securityToken）是否已过期。
+ *
+ * 与 `expiryMs`（会话 JWT 期限）分开：STS 只有约 1 小时，额度/签名接口
+ * 用的是它，过期后订阅查询必然 IAM 401；但 magpie 的 `expires` 故意写
+ * 会话期限，不能拿它判断 STS 是否还活着。
+ */
+export function stsExpired(cred, nowMs = Date.now(), leadMs = 0) {
+  const raw = cred?.expiresAt ?? cred?.expires_at
+  if (!raw) return false
+  const at = typeof raw === "number" ? raw : Date.parse(raw)
+  return Number.isFinite(at) ? at <= nowMs + leadMs : false
+}
+
+/**
  * 基本认证的指纹（key + secret + 宿主）。
  *
  * 用途：续期后判断「凭据真的换了吗」。

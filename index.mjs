@@ -44,6 +44,7 @@ import path from "node:path"
 import { CLIENT_ID, EXPIRY_LEAD_MS } from "./src/constants.mjs"
 import { credentialOf, toStored, expiryMs } from "./src/credential.mjs"
 import { makeDeadRefreshGuard } from "./src/refresh-guard.mjs"
+import { makeStsFresh } from "./src/sts-refresh.mjs"
 import { accountIdentityOf, phoneField, profileOf } from "./src/phone.mjs"
 import { ImportError, importFields, makeCollector, makeImportHook, validateImportDpop, validateImportExpiry, validateImportMaas, validateImportVerifier } from "./src/importer.mjs"
 import { makePasteImportMethod } from "./src/paste-import.mjs"
@@ -537,6 +538,8 @@ export const OfficeAceAuthPlugin = async ({ client, magpie, directory } = {}, op
   const deadRefresh = makeDeadRefreshGuard({
     file: path.join(path.dirname(authFile), "officeace-dead-refresh.json"),
   })
+  // 读额度前检查 STS 临时凭据是否过期，过期则续一次并落盘
+  const stsFresh = makeStsFresh({ authFile, guard: deadRefresh })
   // 测试注入：真实的 beginLogin 会去 CLAW 注册 state 并后台轮询 10 分钟
   // 登录入口统一走 src/login-method.mjs：现在只有浏览器实现；下一期把
   // options.builtinLogin（账号/密码/验证码）传进来即可，浏览器自动降为回退。
@@ -1246,7 +1249,9 @@ export const OfficeAceAuthPlugin = async ({ client, magpie, directory } = {}, op
         if (!stored) return { error: "未登录", windows: [] }
 
         // 旧记录先补 model_info —— 有模型网关就不用再标「未接入 MaaS」
-        const cred = await hydratedCredential(stored, maasFetcher)
+        const hydrated = await hydratedCredential(stored, maasFetcher)
+        // STS 只有约 1 小时寿命；过期先续一次，否则订阅查询必然 IAM 401
+        const cred = await stsFresh(hydrated)
         // 「个人体验版」：缺 trial SKU 时自动免费开通（每进程每账号只尝试一次）
         await ensureTrialPackage(cred, trialDeps).catch(() => {})
 

@@ -61,6 +61,8 @@ import { pastHalfLife, readJwtClaims } from "../token-life.mjs"
 import { ImportError, importFields, makeCollector, makeImportHook, validateImportDpop, validateImportExpiry, validateImportMaas, validateImportVerifier } from "../importer.mjs"
 import { makePasteImportMethod } from "../paste-import.mjs"
 import { officeAceAuthFile } from "../accounts.mjs"
+import { makeDeadRefreshGuard } from "../refresh-guard.mjs"
+import { makeStsFresh } from "../sts-refresh.mjs"
 import { beginLogin as beginOfficeAceLogin } from "../login.mjs"
 import { launchIsolatedLogin } from "../isolated-login.mjs"
 import { confirmInviteByCode, ensureInviteCode, noteAccount, resolveInviteCode, syncAccounts } from "./invite.mjs"
@@ -3487,6 +3489,11 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
   // magpie 保存账号的那个文件（只读；见 src/accounts.mjs）。导入去重与分配新键都读它。
   // 测试可注入；没有注入时与其它 provider 同一个路径规则。
   const codeArtsAuthFile = officeAceAuthFile({ file: options?.authFile })
+  // 与 OfficeAce 共用同一份一次性 token 冷却；STS 过期时读额度前先续一次
+  const deadRefresh = makeDeadRefreshGuard({
+    file: path.join(path.dirname(codeArtsAuthFile), "officeace-dead-refresh.json"),
+  })
+  const stsFresh = makeStsFresh({ authFile: codeArtsAuthFile, guard: deadRefresh })
   const ledgerPath = typeof options?.ledgerPath === "string" && options.ledgerPath ? options.ledgerPath : defaultLedgerPath()
   // Test hooks: the clock and the sleep the retry budget runs on.
   const now = typeof options?.now === "function" ? options.now : Date.now
@@ -3928,8 +3935,10 @@ export const CodeArtsAuthPlugin = async (_ctx = {}, options = {}) => {
        */
       async usage(getAuth) {
         const auth = await getAuth()
-        const cred = credentialOf(auth)
-        if (!cred?.access_key_id) return { error: "not signed in", windows: [] }
+        const stored = credentialOf(auth)
+        if (!stored?.access_key_id) return { error: "not signed in", windows: [] }
+        // STS 临时凭据只有约 1 小时；过期先续一次再读额度（一次性 token 会落盘）
+        const cred = await stsFresh(stored)
         const identity = accountIdentityOf(cred).id
         if (identity) noteProviderAccount(PROVIDER, identity)
 
